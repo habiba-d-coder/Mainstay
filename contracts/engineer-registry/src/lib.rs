@@ -125,7 +125,8 @@ impl EngineerRegistry {
             panic_with_error!(&env, ContractError::InvalidValidityPeriod);
         }
 
-        // Check if engineer already has an active record
+        // Check if an engineer record already exists and is *not revoked*.
+        // Re-registering would otherwise silently overwrite credentials.
         if let Some(existing) = env
             .storage()
             .persistent()
@@ -134,7 +135,12 @@ impl EngineerRegistry {
             if existing.active {
                 panic_with_error!(&env, ContractError::EngineerAlreadyRegistered);
             }
+            // existing is present but not active (revoked) => allow re-registration.
         }
+
+
+
+
 
         let now = env.ledger().timestamp();
         let record = Engineer {
@@ -2053,6 +2059,34 @@ mod tests {
         client.register_engineer(&engineer, &new_hash, &issuer, &31_536_000);
         assert!(client.verify_engineer(&engineer));
     }
+
+    #[test]
+    fn test_register_engineer_rejects_duplicate_registration_when_active() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let hash1 = BytesN::from_array(&env, &[1u8; 32]);
+        let hash2 = BytesN::from_array(&env, &[2u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer);
+
+        // First registration succeeds
+        client.register_engineer(&engineer, &hash1, &issuer, &31_536_000);
+        assert!(client.verify_engineer(&engineer));
+
+        // Second registration with same engineer (still active) must panic
+        let result = client.try_register_engineer(&engineer, &hash2, &issuer, &31_536_000);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::EngineerAlreadyRegistered as u32,
+            ))),
+        );
+    }
+
 
     #[test]
     fn test_no_duplicate_in_issuer_list_after_reregistration() {
