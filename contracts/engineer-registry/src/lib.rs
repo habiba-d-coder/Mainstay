@@ -22,6 +22,8 @@ pub enum ContractError {
     PendingAdminAlreadyExists = 12,
     InvalidValidityPeriod = 13,
     IssuerRemoved = 14,
+    TimelockNotExpired = 15,
+    ProposalNotFound = 16,
 }
 
 #[contracttype]
@@ -44,8 +46,19 @@ pub enum EngineerStatus {
     NotFound = 3,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TimelockProposal {
+    pub proposed_at: u64,
+    pub executed: bool,
+}
+
 fn engineer_key(addr: &Address) -> (Symbol, Address) {
     (symbol_short!("ENG"), addr.clone())
+}
+
+fn revoke_timelock_key(engineer: &Address) -> (Symbol, Address) {
+    (symbol_short!("TL_RVK"), engineer.clone())
 }
 
 const PAUSED_KEY: Symbol = symbol_short!("PAUSED");
@@ -53,7 +66,7 @@ const REG_ENG_TOPIC: Symbol = symbol_short!("REG_ENG");
 const REVOKE_TOPIC: Symbol = symbol_short!("REV_CRED");
 const MIN_VALIDITY_PERIOD: u64 = 86_400;
 const EVENT_PROP_ADMIN: Symbol = symbol_short!("PROP_ADM");
-
+const TIMELOCK_DELAY_SECS: u64 = 48 * 60 * 60;
 
 /// Soroban persistent-storage TTL constants.
 /// 1 ledger ≈ 5 seconds → 518_400 ledgers ≈ 30 days.
@@ -68,6 +81,26 @@ fn ensure_not_paused(env: &Env) {
     if is_paused(env) {
         panic_with_error!(env, ContractError::Paused);
     }
+}
+
+fn require_revoke_timelock_ready(env: &Env, engineer: &Address) {
+    let key = revoke_timelock_key(engineer);
+    let mut proposal: TimelockProposal = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or_else(|| panic_with_error!(env, ContractError::ProposalNotFound));
+    if proposal.executed {
+        panic_with_error!(env, ContractError::ProposalNotFound);
+    }
+    if env.ledger().timestamp().saturating_sub(proposal.proposed_at) < TIMELOCK_DELAY_SECS {
+        panic_with_error!(env, ContractError::TimelockNotExpired);
+    }
+    proposal.executed = true;
+    env.storage().persistent().set(&key, &proposal);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
 }
 
 fn admin_key() -> Symbol {
@@ -99,6 +132,32 @@ pub struct EngineerRegistry;
 
 #[contractimpl]
 impl EngineerRegistry {
+    pub fn propose_revoke_credential(env: Env, engineer: Address) {
+        ensure_not_paused(&env);
+        let record: Engineer = env
+            .storage()
+            .persistent()
+            .get(&engineer_key(&engineer))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::EngineerNotFound));
+        record.issuer.require_auth();
+        let key = revoke_timelock_key(&engineer);
+        env.storage().persistent().set(
+            &key,
+            &TimelockProposal {
+                proposed_at: env.ledger().timestamp(),
+                executed: false,
+            },
+        );
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+    }
+
+    pub fn execute_revoke_credential(env: Env, engineer: Address) {
+        require_revoke_timelock_ready(&env, &engineer);
+        Self::revoke_credential(env, engineer);
+    }
+
     /// Register a new engineer with their credential information.
     /// Only trusted issuers can register engineers.
     ///

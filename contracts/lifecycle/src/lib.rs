@@ -23,6 +23,8 @@ pub enum ContractError {
     SameRegistryAddress = 13,
     IndexOutOfBounds = 14,
     UnauthorizedOwner = 15,
+    TimelockNotExpired = 16,
+    ProposalNotFound = 17,
 }
 
 #[contracttype]
@@ -62,6 +64,13 @@ pub struct Config {
     pub max_notes_length: u32,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TimelockProposal {
+    pub proposed_at: u64,
+    pub executed: bool,
+}
+
 const ASSET_REGISTRY: Symbol = symbol_short!("REGISTRY");
 const ENG_REGISTRY: Symbol = symbol_short!("ENG_REG");
 const CONFIG: Symbol = symbol_short!("CONFIG");
@@ -73,6 +82,7 @@ const DEFAULT_DECAY_RATE: u32 = 5;
 const DEFAULT_DECAY_INTERVAL: u64 = 2592000; // 30 days in seconds
 const DEFAULT_ELIGIBILITY_THRESHOLD: u32 = 50;
 const DEFAULT_MAX_NOTES_LENGTH: u32 = 256;
+const TIMELOCK_DELAY_SECS: u64 = 48 * 60 * 60;
 /// Minimum score returned for an asset that has at least one maintenance record.
 /// Prevents decay from making a legitimately-maintained asset indistinguishable
 /// from one with no history at all.
@@ -95,6 +105,10 @@ const TTL_TARGET: u32 = 518_400;
 
 fn history_key(asset_id: u64) -> (Symbol, u64) {
     (symbol_short!("HIST"), asset_id)
+}
+
+fn timelock_key(op: Symbol) -> (Symbol, Symbol) {
+    (symbol_short!("TL_PROP"), op)
 }
 
 fn score_key(asset_id: u64) -> (Symbol, u64) {
@@ -220,6 +234,52 @@ fn ensure_not_paused(env: &Env) {
     if is_paused(env) {
         panic_with_error!(env, ContractError::Paused);
     }
+}
+
+fn require_admin(env: &Env, admin: &Address) {
+    admin.require_auth();
+    let config: Config = env
+        .storage()
+        .persistent()
+        .get(&CONFIG)
+        .unwrap_or_else(|| panic_with_error!(env, ContractError::NotInitialized));
+    if config.admin != *admin {
+        panic_with_error!(env, ContractError::UnauthorizedAdmin);
+    }
+}
+
+fn store_timelock(env: &Env, op: Symbol) {
+    let key = timelock_key(op);
+    env.storage().persistent().set(
+        &key,
+        &TimelockProposal {
+            proposed_at: env.ledger().timestamp(),
+            executed: false,
+        },
+    );
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+}
+
+fn require_timelock_ready(env: &Env, op: Symbol) {
+    let key = timelock_key(op);
+    let mut proposal: TimelockProposal = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or_else(|| panic_with_error!(env, ContractError::ProposalNotFound));
+    if proposal.executed {
+        panic_with_error!(env, ContractError::ProposalNotFound);
+    }
+    if env.ledger().timestamp().saturating_sub(proposal.proposed_at) < TIMELOCK_DELAY_SECS {
+        panic_with_error!(env, ContractError::TimelockNotExpired);
+    }
+    proposal.executed = true;
+    env.storage().persistent().set(&key, &proposal);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
 }
 
 /// Compute the decayed score without writing anything to storage.
@@ -391,6 +451,52 @@ pub struct Lifecycle;
 
 #[contractimpl]
 impl Lifecycle {
+    pub fn propose_config_update(env: Env, admin: Address, op: Symbol) {
+        ensure_not_paused(&env);
+        require_admin(&env, &admin);
+        store_timelock(&env, op);
+    }
+
+    pub fn execute_update_score_increment(env: Env, admin: Address, score_increment: u32) {
+        require_timelock_ready(&env, symbol_short!("SC_INC"));
+        Self::update_score_increment(env, admin, score_increment);
+    }
+
+    pub fn execute_update_decay_config(
+        env: Env,
+        admin: Address,
+        decay_rate: u32,
+        decay_interval: u64,
+    ) {
+        require_timelock_ready(&env, symbol_short!("DEC_CFG"));
+        Self::update_decay_config(env, admin, decay_rate, decay_interval);
+    }
+
+    pub fn execute_update_eligibility(env: Env, admin: Address, threshold: u32) {
+        require_timelock_ready(&env, symbol_short!("ELIG"));
+        Self::update_eligibility_threshold(env, admin, threshold);
+    }
+
+    pub fn execute_update_max_history(env: Env, admin: Address, new_max: u32) {
+        require_timelock_ready(&env, symbol_short!("MAX_HIST"));
+        Self::update_max_history(env, admin, new_max);
+    }
+
+    pub fn execute_update_max_notes_length(env: Env, admin: Address, new_max: u32) {
+        require_timelock_ready(&env, symbol_short!("MAX_NOTE"));
+        Self::update_max_notes_length(env, admin, new_max);
+    }
+
+    pub fn execute_update_asset_registry(env: Env, admin: Address, new_registry: Address) {
+        require_timelock_ready(&env, symbol_short!("AST_REG"));
+        Self::update_asset_registry(env, admin, new_registry);
+    }
+
+    pub fn execute_update_engineer_registry(env: Env, admin: Address, new_registry: Address) {
+        require_timelock_ready(&env, symbol_short!("ENG_REG"));
+        Self::update_engineer_registry(env, admin, new_registry);
+    }
+
     /// Initialize the lifecycle contract with registry addresses and configuration.
     /// Must be called once after deployment to bind dependent registries.
     ///
