@@ -37,20 +37,32 @@ stellar contract deploy --wasm target/wasm32-unknown-unknown/release/lifecycle.w
 
 ## 3. Initialization & TTL Setup
 
+> **Security: deployer-only initialization**
+> Each `initialize_admin` / `initialize` call now requires the `deployer` argument to sign the
+> transaction. The `--source deployer` flag on the Stellar CLI satisfies this requirement.
+> **Complete all three initialization steps in the same block as deployment** (or immediately
+> after) to eliminate the window in which an observer could front-run initialization with their
+> own address.
+
 ### 3.1 Initialize Asset Registry Admin
 ```bash
-stellar contract invoke --id AR_ID --network testnet --source deployer -- initialize_admin --admin <ADMIN_ADDRESS>
+stellar contract invoke --id AR_ID --network testnet --source deployer -- initialize_admin \
+  --deployer <DEPLOYER_ADDRESS> \
+  --admin <ADMIN_ADDRESS>
 ```
 
 ### 3.2 Initialize Engineer Registry Admin
 ```bash
-stellar contract invoke --id ER_ID --network testnet --source deployer -- initialize_admin --admin <ADMIN_ADDRESS>
+stellar contract invoke --id ER_ID --network testnet --source deployer -- initialize_admin \
+  --deployer <DEPLOYER_ADDRESS> \
+  --admin <ADMIN_ADDRESS>
 ```
 
 ### 3.3 Initialize Lifecycle Binding
 Connect Lifecycle to AR and ER:
 ```bash
 stellar contract invoke --id LC_ID --network testnet --source deployer -- initialize \
+  --deployer <DEPLOYER_ADDRESS> \
   --asset_registry AR_ID \
   --engineer_registry ER_ID \
   --admin <ADMIN_ADDRESS> \

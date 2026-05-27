@@ -72,6 +72,10 @@ const DEFAULT_DECAY_RATE: u32 = 5;
 const DEFAULT_DECAY_INTERVAL: u64 = 2592000; // 30 days in seconds
 const DEFAULT_ELIGIBILITY_THRESHOLD: u32 = 50;
 const DEFAULT_MAX_NOTES_LENGTH: u32 = 256;
+/// Minimum score returned for an asset that has at least one maintenance record.
+/// Prevents decay from making a legitimately-maintained asset indistinguishable
+/// from one with no history at all.
+const MIN_SCORE_WITH_HISTORY: u32 = 1;
 
 const EVENT_INIT: Symbol = symbol_short!("INIT");
 const EVENT_MAINT: Symbol = symbol_short!("MAINT");
@@ -82,6 +86,11 @@ const EVENT_RST_SCR: Symbol = symbol_short!("RST_SCR");
 const EVENT_XFER: Symbol = symbol_short!("XFER");
 const EVENT_PROP_ADMIN: Symbol = symbol_short!("PROP_ADM");
 const EVENT_ADMIN_SET: Symbol = symbol_short!("ADMIN_SET");
+
+/// Soroban persistent-storage TTL constants.
+/// 1 ledger ≈ 5 seconds → 518_400 ledgers ≈ 30 days.
+const TTL_THRESHOLD: u32 = 518_400;
+const TTL_TARGET: u32 = 518_400;
 
 fn history_key(asset_id: u64) -> (Symbol, u64) {
     (symbol_short!("HIST"), asset_id)
@@ -109,7 +118,7 @@ fn score_history_push(env: &Env, asset_id: u64, entry: ScoreEntry, max_history: 
     }
     history.push_back(entry);
     env.storage().persistent().set(&key, &history);
-    env.storage().persistent().extend_ttl(&key, 518400, 518400);
+    env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
 }
 
 fn last_update_key(asset_id: u64) -> (Symbol, u64) {
@@ -145,7 +154,7 @@ fn engineer_history_add(env: &Env, engineer: &Address, asset_id: u64, max_histor
     }
 
     env.storage().persistent().set(&key, &ids);
-    env.storage().persistent().extend_ttl(&key, 518400, 518400);
+    env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
 }
 
 fn engineer_history_remove(env: &Env, engineer: &Address, asset_id: u64) {
@@ -161,7 +170,7 @@ fn engineer_history_remove(env: &Env, engineer: &Address, asset_id: u64) {
         if let Some(i) = index {
             ids.remove(i);
             env.storage().persistent().set(&key, &ids);
-            env.storage().persistent().extend_ttl(&key, 518400, 518400);
+            env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
         }
     }
 }
@@ -184,14 +193,14 @@ fn set_asset_registry_addr(env: &Env, addr: &Address) {
     env.storage().persistent().set(&ASSET_REGISTRY, addr);
     env.storage()
         .persistent()
-        .extend_ttl(&ASSET_REGISTRY, 518400, 518400);
+        .extend_ttl(&ASSET_REGISTRY, TTL_THRESHOLD, TTL_TARGET);
 }
 
 fn set_engineer_registry_addr(env: &Env, addr: &Address) {
     env.storage().persistent().set(&ENG_REGISTRY, addr);
     env.storage()
         .persistent()
-        .extend_ttl(&ENG_REGISTRY, 518400, 518400);
+        .extend_ttl(&ENG_REGISTRY, TTL_THRESHOLD, TTL_TARGET);
 }
 
 fn is_zero_address(env: &Env, addr: &Address) -> bool {
@@ -256,7 +265,7 @@ fn apply_decay(
         if env.storage().persistent().has(&last_update_key(asset_id)) {
             env.storage()
                 .persistent()
-                .extend_ttl(&last_update_key(asset_id), 518400, 518400);
+                .extend_ttl(&last_update_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
         }
         return 0;
     }
@@ -281,10 +290,10 @@ fn apply_decay(
     if decay_intervals == 0 && !update_on_zero_interval {
         env.storage()
             .persistent()
-            .extend_ttl(&score_key(asset_id), 518400, 518400);
+            .extend_ttl(&score_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
         env.storage()
             .persistent()
-            .extend_ttl(&last_update_key(asset_id), 518400, 518400);
+            .extend_ttl(&last_update_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
         return current_score;
     }
 
@@ -296,13 +305,13 @@ fn apply_decay(
         .set(&score_key(asset_id), &new_score);
     env.storage()
         .persistent()
-        .extend_ttl(&score_key(asset_id), 518400, 518400);
+        .extend_ttl(&score_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
     env.storage()
         .persistent()
         .set(&last_update_key(asset_id), &current_time);
     env.storage()
         .persistent()
-        .extend_ttl(&last_update_key(asset_id), 518400, 518400);
+        .extend_ttl(&last_update_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
 
     score_history_push(
         env,
@@ -387,6 +396,7 @@ impl Lifecycle {
     /// # Arguments
     /// * `asset_registry` - Address of the asset registry contract
     /// * `engineer_registry` - Address of the engineer registry contract
+    /// * `deployer` - The address of the contract deployer; must sign this transaction.
     /// * `admin` - Address that will have administrative privileges
     /// * `max_history` - Maximum maintenance records per asset (0 for default 200)
     ///
@@ -394,11 +404,13 @@ impl Lifecycle {
     /// - [`ContractError::AlreadyInitialized`] if contract has already been initialized
     pub fn initialize(
         env: Env,
+        deployer: Address,
         asset_registry: Address,
         engineer_registry: Address,
         admin: Address,
         max_history: u32,
     ) {
+        deployer.require_auth();
         if env.storage().persistent().has(&CONFIG) {
             panic_with_error!(&env, ContractError::AlreadyInitialized);
         }
@@ -425,7 +437,7 @@ impl Lifecycle {
         env.storage().persistent().set(&CONFIG, &config);
         env.storage()
             .persistent()
-            .extend_ttl(&CONFIG, 518400, 518400);
+            .extend_ttl(&CONFIG, TTL_THRESHOLD, TTL_TARGET);
 
         env.events()
             .publish((EVENT_INIT,), (asset_registry, engineer_registry, admin));
@@ -452,7 +464,7 @@ impl Lifecycle {
         env.storage().persistent().set(&PAUSED_KEY, &true);
         env.storage()
             .persistent()
-            .extend_ttl(&PAUSED_KEY, 518400, 518400);
+            .extend_ttl(&PAUSED_KEY, TTL_THRESHOLD, TTL_TARGET);
         env.events().publish((symbol_short!("PAUSED"),), (admin,));
     }
 
@@ -477,7 +489,7 @@ impl Lifecycle {
         env.storage().persistent().set(&PAUSED_KEY, &false);
         env.storage()
             .persistent()
-            .extend_ttl(&PAUSED_KEY, 518400, 518400);
+            .extend_ttl(&PAUSED_KEY, TTL_THRESHOLD, TTL_TARGET);
         env.events().publish((symbol_short!("UNPAUSED"),), (admin,));
     }
 
@@ -541,7 +553,7 @@ impl Lifecycle {
         env.storage().persistent().set(&CONFIG, &config);
         env.storage()
             .persistent()
-            .extend_ttl(&CONFIG, 518400, 518400);
+            .extend_ttl(&CONFIG, TTL_THRESHOLD, TTL_TARGET);
         env.storage().instance().remove(&PENDING_ADMIN_KEY);
         env.events().publish((EVENT_ADMIN_SET,), (pending_admin,));
     }
@@ -579,7 +591,7 @@ impl Lifecycle {
         env.storage().persistent().set(&CONFIG, &config);
         env.storage()
             .persistent()
-            .extend_ttl(&CONFIG, 518400, 518400);
+            .extend_ttl(&CONFIG, TTL_THRESHOLD, TTL_TARGET);
         env.events().publish(
             (symbol_short!("CFG_UPD"),),
             (old_increment, score_increment),
@@ -632,7 +644,7 @@ impl Lifecycle {
         env.storage().persistent().set(&CONFIG, &config);
         env.storage()
             .persistent()
-            .extend_ttl(&CONFIG, 518400, 518400);
+            .extend_ttl(&CONFIG, TTL_THRESHOLD, TTL_TARGET);
     }
 
     /// Admin-only function to update the eligibility threshold for collateral scoring.
@@ -666,7 +678,7 @@ impl Lifecycle {
         env.storage().persistent().set(&CONFIG, &config);
         env.storage()
             .persistent()
-            .extend_ttl(&CONFIG, 518400, 518400);
+            .extend_ttl(&CONFIG, TTL_THRESHOLD, TTL_TARGET);
         env.events()
             .publish((symbol_short!("CFG_UPD"),), (old_threshold, threshold));
     }
@@ -709,7 +721,7 @@ impl Lifecycle {
         env.storage().persistent().set(&CONFIG, &config);
         env.storage()
             .persistent()
-            .extend_ttl(&CONFIG, 518400, 518400);
+            .extend_ttl(&CONFIG, TTL_THRESHOLD, TTL_TARGET);
 
         env.events()
             .publish((symbol_short!("UPD_MAX"), admin), new_max);
@@ -746,7 +758,7 @@ impl Lifecycle {
         env.storage().persistent().set(&CONFIG, &config);
         env.storage()
             .persistent()
-            .extend_ttl(&CONFIG, 518400, 518400);
+            .extend_ttl(&CONFIG, TTL_THRESHOLD, TTL_TARGET);
 
         env.events()
             .publish((symbol_short!("UPD_NOTES"), admin), new_max);
@@ -829,7 +841,7 @@ impl Lifecycle {
             .set(&history_key(asset_id), &history);
         env.storage()
             .persistent()
-            .extend_ttl(&history_key(asset_id), 518400, 518400);
+            .extend_ttl(&history_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
 
         engineer_history_add(&env, &engineer, asset_id, config.max_history);
 
@@ -845,7 +857,7 @@ impl Lifecycle {
             .set(&score_key(asset_id), &new_score);
         env.storage()
             .persistent()
-            .extend_ttl(&score_key(asset_id), 518400, 518400);
+            .extend_ttl(&score_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
 
         // Append (timestamp, score) snapshot to score history
         score_history_push(
@@ -864,7 +876,7 @@ impl Lifecycle {
             .set(&last_update_key(asset_id), &timestamp);
         env.storage()
             .persistent()
-            .extend_ttl(&last_update_key(asset_id), 518400, 518400);
+            .extend_ttl(&last_update_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
 
         // Emit maintenance submission event
         env.events()
@@ -885,6 +897,11 @@ impl Lifecycle {
     /// * `asset_id`      - The unique identifier of the transferred asset
     /// * `previous_owner` - Address of the owner before the transfer
     /// * `new_owner`      - Address of the owner after the transfer
+    ///
+    /// # Events
+    /// Emits `(EVENT_XFER, asset_id)` with data `(previous_owner, new_owner, timestamp, sentinel_index)`
+    /// where `sentinel_index` is the zero-based position of the XFER sentinel in the history vec,
+    /// allowing indexers to directly correlate the event with the record.
     ///
     /// # Panics
     /// - [`ContractError::NotInitialized`] if contract has not been initialized
@@ -921,16 +938,17 @@ impl Lifecycle {
             history.remove(0);
         }
         history.push_back(sentinel);
+        let sentinel_index = history.len() - 1;
         env.storage()
             .persistent()
             .set(&history_key(asset_id), &history);
         env.storage()
             .persistent()
-            .extend_ttl(&history_key(asset_id), 518400, 518400);
+            .extend_ttl(&history_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
 
         env.events().publish(
             (EVENT_XFER, asset_id),
-            (previous_owner, new_owner, timestamp),
+            (previous_owner, new_owner, timestamp, sentinel_index),
         );
     }
 
@@ -1029,17 +1047,17 @@ impl Lifecycle {
             .set(&history_key(asset_id), &history);
         env.storage()
             .persistent()
-            .extend_ttl(&history_key(asset_id), 518400, 518400);
+            .extend_ttl(&history_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
         env.storage().persistent().set(&score_key(asset_id), &score);
         env.storage()
             .persistent()
-            .extend_ttl(&score_key(asset_id), 518400, 518400);
+            .extend_ttl(&score_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
         env.storage()
             .persistent()
             .set(&last_update_key(asset_id), &timestamp);
         env.storage()
             .persistent()
-            .extend_ttl(&last_update_key(asset_id), 518400, 518400);
+            .extend_ttl(&last_update_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
     }
 
     /// Apply time-based decay to an asset's collateral score.
@@ -1179,7 +1197,35 @@ impl Lifecycle {
             .persistent()
             .get::<_, Config>(&CONFIG)
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
-        compute_decay(&env, asset_id)
+        let score = compute_decay(&env, asset_id);
+        // Apply floor: an asset with at least one maintenance record always scores >= 1
+        // so it is never indistinguishable from an asset with no history.
+        let has_history = env
+            .storage()
+            .persistent()
+            .get::<_, Vec<MaintenanceRecord>>(&history_key(asset_id))
+            .map(|h| !h.is_empty())
+            .unwrap_or(false);
+        if has_history && score < MIN_SCORE_WITH_HISTORY {
+            MIN_SCORE_WITH_HISTORY
+        } else {
+            score
+        }
+    }
+
+    pub fn get_collateral_score_batch(env: Env, asset_ids: Vec<u64>) -> Vec<u32> {
+        // Ensure CONFIG is present (NotInitialized guard)
+        env.storage()
+            .persistent()
+            .get::<_, Config>(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+        let asset_registry = get_asset_registry_addr(&env);
+        let mut results: Vec<u32> = Vec::new(&env);
+        for asset_id in asset_ids.iter() {
+            verify_asset_exists(&env, &asset_registry, &asset_id);
+            results.push_back(compute_decay(&env, asset_id));
+        }
+        results
     }
 
     /// Returns the full score trend: one (timestamp, score) entry per maintenance event.
@@ -1265,7 +1311,19 @@ impl Lifecycle {
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
 
         // Use read-only decay computation since we already verified asset exists
-        compute_decay(&env, asset_id) >= config.eligibility_threshold
+        let score = compute_decay(&env, asset_id);
+        let has_history = env
+            .storage()
+            .persistent()
+            .get::<_, Vec<MaintenanceRecord>>(&history_key(asset_id))
+            .map(|h| !h.is_empty())
+            .unwrap_or(false);
+        let effective_score = if has_history && score < MIN_SCORE_WITH_HISTORY {
+            MIN_SCORE_WITH_HISTORY
+        } else {
+            score
+        };
+        effective_score >= config.eligibility_threshold
     }
 
     /// Returns the timestamp of the most recent maintenance event, or None if no maintenance has been submitted.
@@ -1296,11 +1354,10 @@ impl Lifecycle {
     /// * `engineer` - The address of the engineer to query
     ///
     /// # Returns
-    /// A Vec containing all asset IDs this engineer has worked on (capped at 100 entries)
-    ///
-    /// # Note
-    /// For engineers with large maintenance histories, use [`get_eng_history_page`] for pagination
-    /// to avoid high deserialization costs.
+    /// A Vec containing the **first 100** asset IDs this engineer has worked on.
+    /// If the engineer has more than 100 entries the result is silently truncated —
+    /// call [`get_engineer_maintenance_history_count`] to check the total, then use
+    /// [`get_eng_history_page`] with `offset`/`limit` to retrieve the full history.
     pub fn get_engineer_maintenance_history(env: Env, engineer: Address) -> Vec<u64> {
         let history: Vec<u64> = env
             .storage()
@@ -1318,6 +1375,25 @@ impl Lifecycle {
             result.push_back(history.get(i).unwrap());
         }
         result
+    }
+
+    /// Return the total number of asset IDs recorded for an engineer.
+    ///
+    /// Use this together with [`get_eng_history_page`] to paginate through histories
+    /// that exceed the 100-entry cap of [`get_engineer_maintenance_history`].
+    ///
+    /// # Arguments
+    /// * `engineer` - The address of the engineer to query
+    ///
+    /// # Returns
+    /// Total number of entries in the engineer's maintenance history.
+    pub fn get_engineer_maintenance_history_count(env: Env, engineer: Address) -> u32 {
+        let history: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&engineer_history_key(&engineer))
+            .unwrap_or_else(|| Vec::new(&env));
+        history.len()
     }
 
     /// Get a paginated list of asset IDs that an engineer has worked on.
@@ -1509,13 +1585,13 @@ impl Lifecycle {
         env.storage().persistent().set(&score_key(asset_id), &0u32);
         env.storage()
             .persistent()
-            .extend_ttl(&score_key(asset_id), 518400, 518400);
+            .extend_ttl(&score_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
         env.storage()
             .persistent()
             .set(&last_update_key(asset_id), &now);
         env.storage()
             .persistent()
-            .extend_ttl(&last_update_key(asset_id), 518400, 518400);
+            .extend_ttl(&last_update_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
         score_history_push(
             &env,
             asset_id,
@@ -1603,7 +1679,7 @@ impl Lifecycle {
                 env.storage().persistent().set(&history_key, &pruned);
                 env.storage()
                     .persistent()
-                    .extend_ttl(&history_key, 518400, 518400);
+                    .extend_ttl(&history_key, TTL_THRESHOLD, TTL_TARGET);
             }
         }
 
@@ -1626,7 +1702,7 @@ impl Lifecycle {
                     .set(&score_history_key_val, &pruned);
                 env.storage()
                     .persistent()
-                    .extend_ttl(&score_history_key_val, 518400, 518400);
+                    .extend_ttl(&score_history_key_val, TTL_THRESHOLD, TTL_TARGET);
             }
         }
 
@@ -1730,6 +1806,7 @@ mod tests {
 
         let lifecycle = LifecycleClient::new(env, &lifecycle_id);
         lifecycle.initialize(
+            &admin,
             &asset_registry_id,
             &engineer_registry_id,
             &admin,
@@ -1737,7 +1814,7 @@ mod tests {
         );
 
         let asset_registry = AssetRegistryClient::new(env, &asset_registry_id);
-        asset_registry.initialize_admin(&asset_admin);
+        asset_registry.initialize_admin(&asset_admin, &asset_admin);
         asset_registry.add_asset_type(&asset_admin, &symbol_short!("GENSET"));
 
         (
@@ -1762,7 +1839,7 @@ mod tests {
         let issuer = Address::generate(env);
         let admin = Address::generate(env);
         let hash = BytesN::from_array(env, &[1u8; 32]);
-        registry_client.initialize_admin(&admin);
+        registry_client.initialize_admin(&admin, &admin);
         registry_client.add_trusted_issuer(&admin, &issuer);
         registry_client.register_engineer(&engineer, &hash, &issuer, &31_536_000);
         engineer
@@ -2878,7 +2955,7 @@ mod tests {
         let admin = Address::generate(&env);
 
         let lifecycle = LifecycleClient::new(&env, &lifecycle_id);
-        lifecycle.initialize(&asset_registry_id, &engineer_registry_id, &admin, &0u32);
+        lifecycle.initialize(&admin, &asset_registry_id, &engineer_registry_id, &admin, &0u32);
 
         let events = env.events().all();
         assert_eq!(events.len(), 1);
@@ -2895,7 +2972,7 @@ mod tests {
         let admin = Address::generate(&env);
 
         let lifecycle = LifecycleClient::new(&env, &lifecycle_id);
-        lifecycle.initialize(&asset_registry_id, &engineer_registry_id, &admin, &0u32);
+        lifecycle.initialize(&admin, &asset_registry_id, &engineer_registry_id, &admin, &0u32);
 
         // Try to initialize again
         let result =
@@ -3236,6 +3313,93 @@ mod tests {
         assert_eq!(
             stored_b_after, stored_b_before,
             "batch_is_collateral_eligible must not write decayed score to storage"
+        );
+    }
+
+    // --- get_collateral_score_batch tests ---
+
+    #[test]
+    fn test_get_collateral_score_batch_single_element() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        let asset_id = register_asset(&env, &asset_registry_client);
+
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("ENGINE"),
+            &String::from_str(&env, ""),
+            &engineer,
+        );
+
+        let mut ids = Vec::new(&env);
+        ids.push_back(asset_id);
+        let results = client.get_collateral_score_batch(&ids);
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results.get(0).unwrap(),
+            client.get_collateral_score(&asset_id)
+        );
+    }
+
+    #[test]
+    fn test_get_collateral_score_batch_multi_element() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        let asset_a = register_asset(&env, &asset_registry_client);
+        let asset_b = register_asset(&env, &asset_registry_client);
+
+        for _ in 0..10 {
+            client.submit_maintenance(
+                &asset_a,
+                &symbol_short!("ENGINE"),
+                &String::from_str(&env, ""),
+                &engineer,
+            );
+        }
+        client.submit_maintenance(
+            &asset_b,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, ""),
+            &engineer,
+        );
+
+        let mut ids = Vec::new(&env);
+        ids.push_back(asset_a);
+        ids.push_back(asset_b);
+        let results = client.get_collateral_score_batch(&ids);
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            results.get(0).unwrap(),
+            client.get_collateral_score(&asset_a)
+        );
+        assert_eq!(
+            results.get(1).unwrap(),
+            client.get_collateral_score(&asset_b)
+        );
+    }
+
+    #[test]
+    fn test_get_collateral_score_batch_unknown_asset_returns_error() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _, _, _) = setup(&env, 0);
+        let mut ids = Vec::new(&env);
+        ids.push_back(999u64);
+
+        let result = client.try_get_collateral_score_batch(&ids);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::AssetNotFound as u32,
+            ))),
         );
     }
 
@@ -3995,7 +4159,7 @@ mod tests {
         let admin = Address::generate(&env);
         let hash_v1 = BytesN::from_array(&env, &[1u8; 32]);
 
-        engineer_registry_client.initialize_admin(&admin);
+        engineer_registry_client.initialize_admin(&admin, &admin);
         engineer_registry_client.add_trusted_issuer(&admin, &issuer);
         engineer_registry_client.register_engineer(&engineer, &hash_v1, &issuer, &31_536_000);
 
@@ -4048,7 +4212,7 @@ mod tests {
         let issuer = Address::generate(&env);
         let admin = Address::generate(&env);
         let hash = BytesN::from_array(&env, &[1u8; 32]);
-        engineer_registry_client.initialize_admin(&admin);
+        engineer_registry_client.initialize_admin(&admin, &admin);
         engineer_registry_client.add_trusted_issuer(&admin, &issuer);
         engineer_registry_client.register_engineer(&engineer, &hash, &issuer, &1000);
 
@@ -4096,7 +4260,7 @@ mod tests {
         let issuer = Address::generate(&env);
         let eng_admin = Address::generate(&env);
         let hash = BytesN::from_array(&env, &[1u8; 32]);
-        engineer_registry_client.initialize_admin(&eng_admin);
+        engineer_registry_client.initialize_admin(&eng_admin, &eng_admin);
         engineer_registry_client.add_trusted_issuer(&eng_admin, &issuer);
         // Register with validity_period = 100 seconds
         engineer_registry_client.register_engineer(&engineer, &hash, &issuer, &100);
@@ -4141,7 +4305,7 @@ mod tests {
         let issuer = Address::generate(&env);
         let eng_admin = Address::generate(&env);
         let hash = BytesN::from_array(&env, &[1u8; 32]);
-        engineer_registry_client.initialize_admin(&eng_admin);
+        engineer_registry_client.initialize_admin(&eng_admin, &eng_admin);
         engineer_registry_client.add_trusted_issuer(&eng_admin, &issuer);
         // Register with validity_period = 100 seconds
         engineer_registry_client.register_engineer(&engineer, &hash, &issuer, &100);
@@ -4191,7 +4355,7 @@ mod tests {
         let engineer = Address::generate(&env);
         let issuer = Address::generate(&env);
         let admin = Address::generate(&env);
-        engineer_registry.initialize_admin(&admin);
+        engineer_registry.initialize_admin(&admin, &admin);
         engineer_registry.add_trusted_issuer(&admin, &issuer);
         engineer_registry.register_engineer(
             &engineer,
@@ -4584,6 +4748,30 @@ mod tests {
     }
 
     #[test]
+    fn test_get_engineer_maintenance_history_truncates_at_101() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        for _ in 0..101 {
+            let asset_id = register_asset(&env, &asset_registry_client);
+            client.submit_maintenance(
+                &asset_id,
+                &symbol_short!("OIL_CHG"),
+                &String::from_str(&env, "maintenance"),
+                &engineer,
+            );
+        }
+
+        let history = client.get_engineer_maintenance_history(&engineer);
+        assert_eq!(history.len(), 100u32);
+        // confirm the full count is accessible via the count helper
+        assert_eq!(client.get_engineer_maintenance_history_count(&engineer), 101u32);
+    }
+
+    #[test]
     fn test_get_engineer_maintenance_history_returns_all_if_under_100() {
         let env = Env::default();
         env.mock_all_auths();
@@ -4619,7 +4807,7 @@ mod tests {
         let admin = Address::generate(&env);
 
         let lifecycle = LifecycleClient::new(&env, &lifecycle_id);
-        lifecycle.initialize(&asset_registry_id, &engineer_registry_id, &admin, &0u32);
+        lifecycle.initialize(&admin, &asset_registry_id, &engineer_registry_id, &admin, &0u32);
 
         // Verify registries are accessible normally
         assert_eq!(lifecycle.get_asset_registry(), asset_registry_id);
@@ -5387,7 +5575,7 @@ mod tests {
         let admin = Address::generate(&env);
 
         let client = LifecycleClient::new(&env, &lifecycle_id);
-        client.initialize(&asset_registry_id, &engineer_registry_id, &admin, &0u32);
+        client.initialize(&admin, &asset_registry_id, &engineer_registry_id, &admin, &0u32);
 
         // Pause the contract
         client.pause(&admin);
@@ -5508,7 +5696,7 @@ mod tests {
         let engineer = Address::generate(&env);
         let issuer = Address::generate(&env);
         let eng_admin = Address::generate(&env);
-        engineer_registry.initialize_admin(&eng_admin);
+        engineer_registry.initialize_admin(&eng_admin, &eng_admin);
         engineer_registry.add_trusted_issuer(&eng_admin, &issuer);
         engineer_registry.register_engineer(
             &engineer,
@@ -5579,7 +5767,7 @@ mod tests {
         let engineer = Address::generate(&env);
         let eng_admin = Address::generate(&env);
 
-        engineer_registry.initialize_admin(&eng_admin);
+        engineer_registry.initialize_admin(&eng_admin, &eng_admin);
         engineer_registry.add_trusted_issuer(&eng_admin, &issuer);
         let asset_id = asset_registry.register_asset(
             &symbol_short!("GENSET"),
@@ -5630,6 +5818,72 @@ mod tests {
     }
 
     #[test]
+    fn test_record_transfer_event_includes_sentinel_index() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (lifecycle, asset_registry, engineer_registry, _) = setup(&env, 0);
+
+        let owner = Address::generate(&env);
+        let new_owner = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let engineer = Address::generate(&env);
+        let eng_admin = Address::generate(&env);
+
+        engineer_registry.initialize_admin(&eng_admin);
+        engineer_registry.add_trusted_issuer(&eng_admin, &issuer);
+        let asset_id = asset_registry.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Generator XFER-IDX-001"),
+            &owner,
+        );
+        engineer_registry.register_engineer(
+            &engineer,
+            &BytesN::from_array(&env, &[2u8; 32]),
+            &issuer,
+            &31_536_000,
+        );
+
+        // Submit 2 records so the sentinel lands at index 2
+        lifecycle.submit_maintenance(
+            &asset_id,
+            &symbol_short!("INSPECT"),
+            &String::from_str(&env, "Pre-transfer inspection"),
+            &engineer,
+        );
+        lifecycle.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "Oil change"),
+            &engineer,
+        );
+
+        asset_registry.transfer_asset(&asset_id, &owner, &new_owner);
+        lifecycle.record_transfer(&asset_id, &owner, &new_owner);
+
+        let history = lifecycle.get_maintenance_history(&asset_id);
+        let expected_index = (history.len() - 1) as u32;
+
+        let events = env.events().all();
+        let xfer_event = events
+            .iter()
+            .find(|(_, topics, _)| {
+                topics
+                    .get(0)
+                    .and_then(|v| v.try_into_val::<_, Symbol>(&env).ok())
+                    .map(|s| s == symbol_short!("XFER"))
+                    .unwrap_or(false)
+            })
+            .expect("XFER event not emitted");
+
+        let (_, _, data) = xfer_event;
+        let (_, _, _, emitted_index): (Address, Address, u64, u32) =
+            data.try_into_val(&env).unwrap();
+
+        assert_eq!(emitted_index, expected_index);
+    }
+
+    #[test]
     fn test_purge_asset_data_after_deregister() {
         let env = Env::default();
         env.mock_all_auths();
@@ -5641,7 +5895,7 @@ mod tests {
         let engineer = Address::generate(&env);
         let eng_admin = Address::generate(&env);
 
-        engineer_registry.initialize_admin(&eng_admin);
+        engineer_registry.initialize_admin(&eng_admin, &eng_admin);
         engineer_registry.add_trusted_issuer(&eng_admin, &issuer);
         let asset_id = asset_registry.register_asset(
             &symbol_short!("GENSET"),
@@ -5848,6 +6102,69 @@ mod tests {
 
         // BUG: Currently, asset_id is STILL in engineer's history
         let history_after = lifecycle.get_eng_history_page(&engineer, &0, &10);
-        assert!(!history_after.contains(asset_id), "Asset ID should be removed from engineer history after purge");
+        assert!(
+            !history_after.contains(asset_id),
+            "Asset ID should be removed from engineer history after purge"
+        );
+    }
+
+    #[test]
+    fn test_initialize_rejects_non_deployer() {
+        let env = Env::default();
+        let asset_registry_id = env.register(AssetRegistry, ());
+        let engineer_registry_id = env.register(EngineerRegistry, ());
+        let lifecycle_id = env.register(Lifecycle, ());
+        let client = LifecycleClient::new(&env, &lifecycle_id);
+
+        let deployer = Address::generate(&env);
+        let attacker = Address::generate(&env);
+
+        use soroban_sdk::IntoVal;
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &attacker,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &lifecycle_id,
+                fn_name: "initialize",
+                args: (&attacker, &asset_registry_id, &engineer_registry_id, &attacker, &0u32).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+
+        let result = client.try_initialize(&deployer, &asset_registry_id, &engineer_registry_id, &attacker, &0u32);
+        assert!(result.is_err(), "non-deployer must not be able to initialize");
+    }
+
+    /// An asset with a single maintenance record must never score 0, even after enough
+    /// time has elapsed for decay to fully consume the raw score.
+    #[test]
+    fn test_score_floor_with_sparse_history() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let asset_id = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        // One record → raw score = DEFAULT_SCORE_INCREMENT (5)
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "single record"),
+            &engineer,
+        );
+        assert_eq!(client.get_collateral_score(&asset_id), 5);
+
+        // Advance time by 2 full decay intervals (2 × 30 days).
+        // Decay = 2 × DEFAULT_DECAY_RATE (5) = 10 > raw score (5), so raw result = 0.
+        env.ledger().with_mut(|li| {
+            li.timestamp += 2 * 2_592_000; // 60 days
+        });
+
+        // Floor must kick in: score is 1, not 0.
+        assert_eq!(
+            client.get_collateral_score(&asset_id),
+            1,
+            "asset with maintenance history must not score 0 after decay"
+        );
     }
 }
