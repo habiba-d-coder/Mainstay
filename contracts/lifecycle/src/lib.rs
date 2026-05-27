@@ -148,6 +148,24 @@ fn engineer_history_add(env: &Env, engineer: &Address, asset_id: u64, max_histor
     env.storage().persistent().extend_ttl(&key, 518400, 518400);
 }
 
+fn engineer_history_remove(env: &Env, engineer: &Address, asset_id: u64) {
+    let key = engineer_history_key(engineer);
+    if let Some(mut ids) = env.storage().persistent().get::<_, Vec<u64>>(&key) {
+        let mut index = None;
+        for i in 0..ids.len() {
+            if ids.get(i).unwrap() == asset_id {
+                index = Some(i);
+                break;
+            }
+        }
+        if let Some(i) = index {
+            ids.remove(i);
+            env.storage().persistent().set(&key, &ids);
+            env.storage().persistent().extend_ttl(&key, 518400, 518400);
+        }
+    }
+}
+
 fn get_asset_registry_addr(env: &Env) -> Address {
     env.storage()
         .persistent()
@@ -1643,6 +1661,31 @@ impl Lifecycle {
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
         if config.admin != admin {
             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+
+        // Remove the asset ID from the history of all engineers who worked on it
+        let history_key_val = history_key(asset_id);
+        if let Some(history) = env
+            .storage()
+            .persistent()
+            .get::<_, Vec<MaintenanceRecord>>(&history_key_val)
+        {
+            let mut engineers = Vec::new(&env);
+            for record in history.iter() {
+                let eng = record.engineer;
+                // Check if already in our engineers list to avoid redundant removals
+                let mut found = false;
+                for existing in engineers.iter() {
+                    if existing == eng {
+                        found = true;
+                        break;
+                    }
+                }
+                if !found {
+                    engineers.push_back(eng.clone());
+                    engineer_history_remove(&env, &eng, asset_id);
+                }
+            }
         }
 
         env.storage().persistent().remove(&history_key(asset_id));
@@ -5777,5 +5820,34 @@ mod tests {
                 ContractError::UnauthorizedAdmin as u32,
             ))),
         );
+    }
+
+    #[test]
+    fn test_purge_asset_removes_from_engineer_history() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (lifecycle, asset_registry, engineer_registry, admin) = setup(&env, 0);
+        let asset_id = register_asset(&env, &asset_registry);
+        let engineer = register_engineer(&env, &engineer_registry);
+
+        // Engineer performs maintenance on the asset
+        lifecycle.submit_maintenance(
+            &asset_id,
+            &symbol_short!("INSPECT"),
+            &String::from_str(&env, "Routine check"),
+            &engineer,
+        );
+
+        // Verify asset_id is in engineer's history
+        let history = lifecycle.get_eng_history_page(&engineer, &0, &10);
+        assert!(history.contains(asset_id));
+
+        // Purge the asset
+        lifecycle.purge_asset_data(&admin, &asset_id);
+
+        // BUG: Currently, asset_id is STILL in engineer's history
+        let history_after = lifecycle.get_eng_history_page(&engineer, &0, &10);
+        assert!(!history_after.contains(asset_id), "Asset ID should be removed from engineer history after purge");
     }
 }
