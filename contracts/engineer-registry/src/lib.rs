@@ -197,6 +197,30 @@ impl EngineerRegistry {
             .unwrap_or(false)
     }
 
+    /// Verify multiple engineers in a single call.
+    /// Results are returned in the same order as the input vec.
+    ///
+    /// # Arguments
+    /// * `engineers` - Vec of engineer addresses to verify
+    ///
+    /// # Returns
+    /// `Vec<bool>` where each element is `true` if the corresponding engineer
+    /// has valid, non-expired credentials; `false` otherwise
+    pub fn batch_verify_engineers(env: Env, engineers: Vec<Address>) -> Vec<bool> {
+        let now = env.ledger().timestamp();
+        let mut results: Vec<bool> = Vec::new(&env);
+        for engineer in engineers.iter() {
+            let valid = env
+                .storage()
+                .persistent()
+                .get::<_, Engineer>(&engineer_key(&engineer))
+                .map(|e| e.active && now < e.expires_at)
+                .unwrap_or(false);
+            results.push_back(valid);
+        }
+        results
+    }
+
     /// Revoke an engineer's credentials, making them inactive.
     /// Only the original issuer can revoke credentials.
     ///
@@ -2355,5 +2379,90 @@ mod tests {
                 ContractError::Paused as u32
             )))
         );
+    }
+
+    fn setup_engineer(
+        env: &Env,
+        client: &EngineerRegistryClient,
+        issuer: &Address,
+        seed: u8,
+    ) -> Address {
+        let engineer = Address::generate(env);
+        client.register_engineer(
+            &engineer,
+            &BytesN::from_array(env, &[seed; 32]),
+            issuer,
+            &31_536_000,
+        );
+        engineer
+    }
+
+    #[test]
+    fn test_batch_verify_engineers_all_active() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(EngineerRegistry, ());
+        let client = EngineerRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        client.initialize_admin(&admin);
+        client.add_trusted_issuer(&admin, &issuer);
+
+        let e1 = setup_engineer(&env, &client, &issuer, 1);
+        let e2 = setup_engineer(&env, &client, &issuer, 2);
+        let e3 = setup_engineer(&env, &client, &issuer, 3);
+
+        let results = client.batch_verify_engineers(&soroban_sdk::vec![&env, e1, e2, e3]);
+        assert_eq!(results.len(), 3);
+        assert!(results.get(0).unwrap());
+        assert!(results.get(1).unwrap());
+        assert!(results.get(2).unwrap());
+    }
+
+    #[test]
+    fn test_batch_verify_engineers_mixed() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(EngineerRegistry, ());
+        let client = EngineerRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        client.initialize_admin(&admin);
+        client.add_trusted_issuer(&admin, &issuer);
+
+        let active = setup_engineer(&env, &client, &issuer, 10);
+        let revoked = setup_engineer(&env, &client, &issuer, 11);
+        let unknown = Address::generate(&env);
+
+        client.revoke_credential(&revoked);
+
+        let results =
+            client.batch_verify_engineers(&soroban_sdk::vec![&env, active, revoked, unknown]);
+        assert_eq!(results.len(), 3);
+        assert!(results.get(0).unwrap());   // active
+        assert!(!results.get(1).unwrap());  // revoked
+        assert!(!results.get(2).unwrap());  // not registered
+    }
+
+    #[test]
+    fn test_batch_verify_engineers_all_inactive() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(EngineerRegistry, ());
+        let client = EngineerRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        client.initialize_admin(&admin);
+        client.add_trusted_issuer(&admin, &issuer);
+
+        let e1 = setup_engineer(&env, &client, &issuer, 20);
+        let e2 = setup_engineer(&env, &client, &issuer, 21);
+        client.revoke_credential(&e1);
+        client.revoke_credential(&e2);
+
+        let results = client.batch_verify_engineers(&soroban_sdk::vec![&env, e1, e2]);
+        assert_eq!(results.len(), 2);
+        assert!(!results.get(0).unwrap());
+        assert!(!results.get(1).unwrap());
     }
 }
