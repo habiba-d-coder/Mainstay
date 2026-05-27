@@ -252,6 +252,8 @@ impl EngineerRegistry {
         if !record.active {
             panic_with_error!(&env, ContractError::CredentialAlreadyRevoked);
         }
+        let credential_hash = record.credential_hash.clone();
+        let revoked_by = record.issuer.clone();
         // Extend TTL before write to ensure consistency even on near-expired entries
         env.storage()
             .persistent()
@@ -262,9 +264,10 @@ impl EngineerRegistry {
             .set(&engineer_key(&engineer), &record);
 
         // Emit credential revocation event
+        let timestamp = env.ledger().timestamp();
         env.events().publish(
-            (REVOKE_TOPIC, engineer.clone()),
-            (record.issuer.clone(), env.ledger().timestamp()),
+            (symbol_short!("revoke"),),
+            (engineer.clone(), credential_hash, revoked_by, timestamp),
         );
     }
 
@@ -776,13 +779,19 @@ mod tests {
         let (_, topics, data) = events.last().unwrap();
 
         use soroban_sdk::TryIntoVal;
+        let revoke_topic = symbol_short!("revoke");
         let t0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
-        let t1: Address = topics.get(1).unwrap().try_into_val(&env).unwrap();
-        assert_eq!(t0, REVOKE_TOPIC);
-        assert_eq!(t1, engineer);
+        assert_eq!(t0, revoke_topic);
 
-        let (emitted_issuer, emitted_timestamp): (Address, u64) = data.try_into_val(&env).unwrap();
-        assert_eq!(emitted_issuer, issuer);
+        let (
+            emitted_engineer,
+            emitted_hash,
+            emitted_revoked_by,
+            emitted_timestamp,
+        ): (Address, BytesN<32>, Address, u64) = data.try_into_val(&env).unwrap();
+        assert_eq!(emitted_engineer, engineer);
+        assert_eq!(emitted_hash, hash);
+        assert_eq!(emitted_revoked_by, issuer);
         assert_eq!(emitted_timestamp, revoked_at);
     }
 
