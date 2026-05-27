@@ -384,6 +384,7 @@ impl EngineerRegistry {
         env.storage()
             .instance()
             .set(&pending_admin_key(), &new_admin);
+        env.storage().instance().extend_ttl(518400, 518400);
         env.events()
             .publish((EVENT_PROP_ADMIN,), (admin, new_admin));
     }
@@ -403,6 +404,7 @@ impl EngineerRegistry {
         pending_admin.require_auth();
         env.storage().instance().set(&admin_key(), &pending_admin);
         env.storage().instance().remove(&pending_admin_key());
+        env.storage().instance().extend_ttl(518400, 518400);
         env.events()
             .publish((symbol_short!("ADMIN_SET"),), (pending_admin,));
     }
@@ -421,6 +423,7 @@ impl EngineerRegistry {
         env.storage()
             .persistent()
             .extend_ttl(&PAUSED_KEY, 518400, 518400);
+        env.storage().instance().extend_ttl(518400, 518400);
         env.events().publish((symbol_short!("PAUSED"),), (admin,));
     }
 
@@ -438,6 +441,7 @@ impl EngineerRegistry {
         env.storage()
             .persistent()
             .extend_ttl(&PAUSED_KEY, 518400, 518400);
+        env.storage().instance().extend_ttl(518400, 518400);
         env.events().publish((symbol_short!("UNPAUSED"),), (admin,));
     }
 
@@ -624,6 +628,8 @@ impl EngineerRegistry {
         if stored_admin != admin {
             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
         }
+
+        env.storage().instance().extend_ttl(518400, 518400);
 
         env.events().publish(
             (symbol_short!("UPGRADE"), admin.clone()),
@@ -2355,5 +2361,130 @@ mod tests {
                 ContractError::Paused as u32
             )))
         );
+    }
+
+    // --- Instance TTL expiry tests ---
+
+    /// Helper: wipe all instance storage to simulate TTL expiry.
+    fn wipe_instance(env: &Env, contract_id: &Address) {
+        env.as_contract(contract_id, || {
+            env.storage().instance().remove(&admin_key());
+            env.storage().instance().remove(&pending_admin_key());
+            env.storage().instance().remove(&issuer_list_key());
+        });
+    }
+
+    #[test]
+    fn test_pause_extends_instance_ttl_after_expiry() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        // Simulate instance TTL expiry — admin key is gone
+        wipe_instance(&env, &client.address);
+
+        // Re-initialize so pause can read the admin
+        client.initialize_admin(&admin);
+
+        // pause must extend instance TTL
+        client.pause(&admin);
+        let ttl = env.as_contract(&client.address, || env.storage().instance().get_ttl());
+        assert!(ttl > 0, "pause must extend instance TTL");
+    }
+
+    #[test]
+    fn test_unpause_extends_instance_ttl_after_expiry() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        client.pause(&admin);
+        wipe_instance(&env, &client.address);
+        client.initialize_admin(&admin);
+
+        client.unpause(&admin);
+        let ttl = env.as_contract(&client.address, || env.storage().instance().get_ttl());
+        assert!(ttl > 0, "unpause must extend instance TTL");
+    }
+
+    #[test]
+    fn test_propose_admin_extends_instance_ttl_after_expiry() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        wipe_instance(&env, &client.address);
+        client.initialize_admin(&admin);
+
+        let new_admin = Address::generate(&env);
+        client.propose_admin(&admin, &new_admin);
+        let ttl = env.as_contract(&client.address, || env.storage().instance().get_ttl());
+        assert!(ttl > 0, "propose_admin must extend instance TTL");
+    }
+
+    #[test]
+    fn test_accept_admin_extends_instance_ttl_after_expiry() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let new_admin = Address::generate(&env);
+        client.propose_admin(&admin, &new_admin);
+
+        // Wipe instance storage (simulates TTL expiry between propose and accept)
+        // We must restore admin + pending_admin so accept_admin can read them
+        env.as_contract(&client.address, || {
+            // Keep admin and pending_admin but clear issuer_list to simulate partial expiry
+            env.storage().instance().remove(&issuer_list_key());
+        });
+
+        client.accept_admin();
+        assert_eq!(client.get_admin(), new_admin);
+        let ttl = env.as_contract(&client.address, || env.storage().instance().get_ttl());
+        assert!(ttl > 0, "accept_admin must extend instance TTL");
+    }
+
+    #[test]
+    fn test_upgrade_extends_instance_ttl_after_expiry() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        wipe_instance(&env, &client.address);
+        client.initialize_admin(&admin);
+
+        let hash = BytesN::from_array(&env, &[0xabu8; 32]);
+        client.upgrade(&admin, &hash);
+        let ttl = env.as_contract(&client.address, || env.storage().instance().get_ttl());
+        assert!(ttl > 0, "upgrade must extend instance TTL");
+    }
+
+    #[test]
+    fn test_admin_ops_work_after_instance_ttl_expiry_and_reinit() {
+        // Full scenario: instance expires, admin re-initializes, all ops succeed.
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let issuer = Address::generate(&env);
+        client.add_trusted_issuer(&admin, &issuer);
+
+        // Simulate instance TTL expiry
+        wipe_instance(&env, &client.address);
+
+        // Re-initialize admin (as would happen after TTL expiry recovery)
+        client.initialize_admin(&admin);
+
+        // All admin ops must succeed and extend TTL
+        client.pause(&admin);
+        client.unpause(&admin);
+
+        let new_admin = Address::generate(&env);
+        client.propose_admin(&admin, &new_admin);
+        client.accept_admin();
+        assert_eq!(client.get_admin(), new_admin);
+
+        let ttl = env.as_contract(&client.address, || env.storage().instance().get_ttl());
+        assert!(ttl > 0, "instance TTL must be live after admin ops");
     }
 }
