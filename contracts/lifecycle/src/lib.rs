@@ -22,6 +22,7 @@ pub enum ContractError {
     ZeroAddress = 12,
     SameRegistryAddress = 13,
     IndexOutOfBounds = 14,
+    UnauthorizedOwner = 15,
 }
 
 #[contracttype]
@@ -889,14 +890,19 @@ impl Lifecycle {
     /// `XFER` event so that indexers and new owners can identify the ownership boundary.
     /// Records before this sentinel were performed under the previous owner; records after
     /// it are performed under the new owner.
+    /// Record a sentinel entry in the maintenance history to mark an ownership transfer.
     ///
-    /// Must be called by the current asset owner (i.e. the new owner, immediately after
-    /// `transfer_asset` on the asset registry) or by the lifecycle admin.
+    /// Must be called **after** `asset_registry::transfer_asset` has already updated the
+    /// on-chain owner, and must be called by the new owner (i.e. the address that now owns
+    /// the asset in the registry).  The function cross-calls the asset registry to confirm
+    /// that `new_owner` is indeed the current owner before writing the sentinel, preventing
+    /// a replay of `new_owner`'s signature from inserting a false transfer record into an
+    /// asset they do not own.
     ///
     /// # Arguments
-    /// * `asset_id`      - The unique identifier of the transferred asset
+    /// * `asset_id`       - The unique identifier of the transferred asset
     /// * `previous_owner` - Address of the owner before the transfer
-    /// * `new_owner`      - Address of the owner after the transfer
+    /// * `new_owner`      - Address of the owner after the transfer (must match registry)
     ///
     /// # Events
     /// Emits `(EVENT_XFER, asset_id)` with data `(previous_owner, new_owner, timestamp, sentinel_index)`
@@ -906,6 +912,8 @@ impl Lifecycle {
     /// # Panics
     /// - [`ContractError::NotInitialized`] if contract has not been initialized
     /// - [`ContractError::AssetNotFound`] if the asset does not exist
+    /// - [`ContractError::UnauthorizedOwner`] if `new_owner` does not match the current
+    ///   owner recorded in the asset registry
     pub fn record_transfer(env: Env, asset_id: u64, previous_owner: Address, new_owner: Address) {
         ensure_not_paused(&env);
         new_owner.require_auth();
@@ -918,6 +926,15 @@ impl Lifecycle {
 
         let asset_registry = get_asset_registry_addr(&env);
         verify_asset_exists(&env, &asset_registry, &asset_id);
+
+        // Verify new_owner is actually the current owner in the asset registry.
+        // This prevents a signature replay from inserting a false transfer sentinel
+        // into an asset the caller does not own.
+        let registry_client = asset_registry::AssetRegistryClient::new(&env, &asset_registry);
+        let asset = registry_client.get_asset(&asset_id);
+        if asset.owner != new_owner {
+            panic_with_error!(&env, ContractError::UnauthorizedOwner);
+        }
 
         let timestamp = env.ledger().timestamp();
         let sentinel = MaintenanceRecord {
@@ -5815,6 +5832,42 @@ mod tests {
         // Score and eligibility are preserved for the new owner
         assert!(lifecycle.get_collateral_score(&asset_id) > 0);
         assert_eq!(asset_registry.get_asset(&asset_id).owner, new_owner);
+    }
+
+    /// A non-owner who obtains `new_owner`'s signature for an unrelated transaction
+    /// must not be able to replay it to insert a false transfer sentinel.
+    /// `record_transfer` must reject any call where `new_owner` is not the current
+    /// owner recorded in the asset registry.
+    #[test]
+    fn test_record_transfer_rejects_non_owner() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (lifecycle, asset_registry, _, _) = setup(&env, 0);
+
+        let real_owner = Address::generate(&env);
+        let attacker = Address::generate(&env);
+
+        // Register an asset under real_owner; ownership stays with real_owner.
+        let asset_id = asset_registry.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Generator NON-OWNER-TEST"),
+            &real_owner,
+        );
+
+        // Attacker tries to record a transfer claiming they are the new owner,
+        // but the registry still shows real_owner as the owner.
+        let result = lifecycle.try_record_transfer(&asset_id, &real_owner, &attacker);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::UnauthorizedOwner as u32
+            )))
+        );
+
+        // Confirm no sentinel was written — history must be empty.
+        let history = lifecycle.get_maintenance_history(&asset_id);
+        assert_eq!(history.len(), 0);
     }
 
     #[test]
