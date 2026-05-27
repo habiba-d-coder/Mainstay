@@ -361,12 +361,13 @@ impl EngineerRegistry {
     /// This function should be called once immediately after deployment.
     ///
     /// # Arguments
+    /// * `deployer` - The address of the contract deployer; must sign this transaction.
     /// * `admin` - The address that will have administrative privileges
     ///
     /// # Panics
     /// - [`ContractError::AdminAlreadyInitialized`] if admin has already been initialized
-    pub fn initialize_admin(env: Env, admin: Address) {
-        admin.require_auth();
+    pub fn initialize_admin(env: Env, deployer: Address, admin: Address) {
+        deployer.require_auth();
         if env.storage().instance().has(&admin_key()) {
             panic_with_error!(&env, ContractError::AdminAlreadyInitialized);
         }
@@ -678,7 +679,7 @@ mod tests {
         let contract_id = env.register(EngineerRegistry, ());
         let client = EngineerRegistryClient::new(env, &contract_id);
         let admin = Address::generate(env);
-        client.initialize_admin(&admin);
+        client.initialize_admin(&admin, &admin);
         (client, admin)
     }
 
@@ -691,9 +692,9 @@ mod tests {
         let client = EngineerRegistryClient::new(&env, &contract_id);
 
         let admin = Address::generate(&env);
-        client.initialize_admin(&admin);
+        client.initialize_admin(&admin, &admin);
         // Second call must panic
-        client.initialize_admin(&admin);
+        client.initialize_admin(&admin, &admin);
     }
 
     #[test]
@@ -812,7 +813,7 @@ mod tests {
         let client = EngineerRegistryClient::new(&env, &contract_id);
 
         let admin = Address::generate(&env);
-        client.initialize_admin(&admin);
+        client.initialize_admin(&admin, &admin);
 
         // Second call should fail with structured error
         let result = client.try_initialize_admin(&admin);
@@ -833,7 +834,7 @@ mod tests {
 
         let admin = Address::generate(&env);
         // This should succeed because we mock all auths
-        client.initialize_admin(&admin);
+        client.initialize_admin(&admin, &admin);
 
         // Verify admin was set
         assert_eq!(client.get_admin(), admin);
@@ -847,7 +848,7 @@ mod tests {
         let client = EngineerRegistryClient::new(&env, &contract_id);
 
         let admin = Address::generate(&env);
-        client.initialize_admin(&admin);
+        client.initialize_admin(&admin, &admin);
 
         let ttl = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
         assert!(
@@ -1957,7 +1958,7 @@ mod tests {
                 sub_invokes: &[],
             },
         }]);
-        client.initialize_admin(&admin);
+        client.initialize_admin(&admin, &admin);
 
         // Add both issuers as trusted
         env.mock_auths(&[soroban_sdk::testutils::MockAuth {
@@ -2382,6 +2383,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_initialize_admin_rejects_non_deployer() {
+        let env = Env::default();
+        let contract_id = env.register(EngineerRegistry, ());
+        let client = EngineerRegistryClient::new(&env, &contract_id);
+
+        let deployer = Address::generate(&env);
+        let attacker = Address::generate(&env);
+
+        use soroban_sdk::IntoVal;
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &attacker,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "initialize_admin",
+                args: (&attacker, &attacker).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+
+        let result = client.try_initialize_admin(&deployer, &attacker);
+        assert!(result.is_err(), "non-deployer must not be able to initialize");
     fn setup_engineer(
         env: &Env,
         client: &EngineerRegistryClient,
