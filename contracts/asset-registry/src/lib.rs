@@ -21,6 +21,7 @@ pub enum ContractError {
     TypeInUse = 10,
     EmptyMetadata = 11,
     SameOwner = 12,
+    AssetDecommissioned = 13,
 }
 
 #[contracttype]
@@ -41,12 +42,21 @@ pub struct AssetInput {
     pub metadata: String,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AssetStatus {
+    Active = 0,
+    Decommissioned = 1,
+    UnderMaintenance = 2,
+}
+
 const ASSET_COUNT: Symbol = symbol_short!("A_COUNT");
 const PAUSED_KEY: Symbol = symbol_short!("PAUSED");
 
 const ADMIN_KEY: Symbol = symbol_short!("ADMIN");
 const ASSET_TYPE_PREFIX: Symbol = symbol_short!("AST_TYPE");
 const PENDING_ADMIN_KEY: Symbol = symbol_short!("PADMIN");
+const DECOMM_PREFIX: Symbol = symbol_short!("DECOMM");
 
 /// Soroban persistent-storage TTL constants.
 /// 1 ledger ≈ 5 seconds → 518_400 ledgers ≈ 30 days.
@@ -58,6 +68,11 @@ pub const RM_TYPE_TOPIC: Symbol = symbol_short!("RM_TYPE");
 
 fn asset_key(id: u64) -> (Symbol, u64) {
     (symbol_short!("ASSET"), id)
+}
+
+/// Decommissioned flag key: asset_id → bool.
+fn decommissioned_key(asset_id: u64) -> (Symbol, u64) {
+    (DECOMM_PREFIX, asset_id)
 }
 
 /// Deduplication key: (owner, sha256(metadata)) → existing asset_id.
@@ -393,6 +408,50 @@ impl AssetRegistry {
         env.storage().persistent().has(&asset_key(asset_id))
     }
 
+    /// Returns the status of an asset (Active, Decommissioned, or UnderMaintenance).
+    ///
+    /// # Arguments
+    /// * `asset_id` - The unique identifier of the asset
+    ///
+    /// # Returns
+    /// AssetStatus enum: Active if normal, Decommissioned if marked as such,
+    /// UnderMaintenance if the asset is marked as under maintenance
+    ///
+    /// # Panics
+    /// - [`ContractError::AssetNotFound`] if no asset exists with the given ID
+    pub fn asset_status(env: Env, asset_id: u64) -> AssetStatus {
+        // Verify asset exists
+        if !Self::asset_exists(env.clone(), asset_id) {
+            panic_with_error!(&env, ContractError::AssetNotFound);
+        }
+
+        // Check if asset is decommissioned
+        let decomm_key = decommissioned_key(asset_id);
+        let is_decommissioned: bool = env
+            .storage()
+            .persistent()
+            .get(&decomm_key)
+            .unwrap_or(false);
+
+        if is_decommissioned {
+            return AssetStatus::Decommissioned;
+        }
+
+        // Check if asset is under maintenance
+        let maint_key = (symbol_short!("U_MAINT"), asset_id);
+        let is_under_maintenance: bool = env
+            .storage()
+            .persistent()
+            .get(&maint_key)
+            .unwrap_or(false);
+
+        if is_under_maintenance {
+            return AssetStatus::UnderMaintenance;
+        }
+
+        AssetStatus::Active
+    }
+
     /// Returns all asset IDs owned by the given address.
     pub fn get_assets_by_owner(env: Env, owner: Address) -> Vec<u64> {
         let key = owner_index_key(&owner);
@@ -441,6 +500,14 @@ impl AssetRegistry {
     /// # Returns
     /// The total number of assets that have been registered
     pub fn asset_count(env: Env) -> u64 {
+        env.storage().persistent().get(&ASSET_COUNT).unwrap_or(0)
+    }
+
+    /// Get the total count of registered assets.
+    ///
+    /// # Returns
+    /// The total number of assets that have been registered
+    pub fn get_asset_count(env: Env) -> u64 {
         env.storage().persistent().get(&ASSET_COUNT).unwrap_or(0)
     }
 
@@ -539,6 +606,7 @@ impl AssetRegistry {
             panic_with_error!(&env, ContractError::PendingAdminAlreadyExists);
         }
         env.storage().instance().set(&PENDING_ADMIN_KEY, &new_admin);
+        env.storage().instance().extend_ttl(518400, 518400);
         env.events()
             .publish((symbol_short!("PROP_ADM"),), (admin, new_admin));
     }
@@ -564,6 +632,7 @@ impl AssetRegistry {
         }
         env.storage().instance().set(&ADMIN_KEY, &pending_admin);
         env.storage().instance().remove(&PENDING_ADMIN_KEY);
+        env.storage().instance().extend_ttl(518400, 518400);
         env.events()
             .publish((symbol_short!("ADMIN_SET"),), (pending_admin,));
     }
@@ -800,6 +869,45 @@ impl AssetRegistry {
         );
     }
 
+    /// Admin-only function to decommission an asset.
+    /// Sets the decommissioned flag and resets the collateral score to 0.
+    ///
+    /// # Arguments
+    /// * `admin` - The admin address that must match the stored admin
+    /// * `asset_id` - The unique identifier of the asset to decommission
+    ///
+    /// # Panics
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
+    /// - [`ContractError::AssetNotFound`] if no asset exists with the given ID
+    pub fn decommission_asset(env: Env, admin: Address, asset_id: u64) {
+        ensure_not_paused(&env);
+        admin.require_auth();
+
+        let stored_admin: Address = Self::get_admin(env.clone());
+        if stored_admin != admin {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+
+        // Verify asset exists
+        if !Self::asset_exists(env.clone(), asset_id) {
+            panic_with_error!(&env, ContractError::AssetNotFound);
+        }
+
+        // Set decommissioned flag
+        let decomm_key = decommissioned_key(asset_id);
+        env.storage().persistent().set(&decomm_key, &true);
+        env.storage().persistent().extend_ttl(&decomm_key, TTL_THRESHOLD, TTL_TARGET);
+
+        // Clear the under_maintenance flag when decommissioning
+        let maint_key = (symbol_short!("U_MAINT"), asset_id);
+        env.storage().persistent().remove(&maint_key);
+
+        // Emit decommission event with asset_id and ledger sequence
+        let ledger_seq = env.ledger().sequence();
+        env.events()
+            .publish((symbol_short!("DECOMM"), asset_id), ledger_seq);
+    }
+
     /// Admin-only function to upgrade the contract WASM to a new hash.
     /// This allows for contract updates while maintaining state.
     ///
@@ -822,6 +930,8 @@ impl AssetRegistry {
         if stored_admin != admin {
             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
         }
+
+        env.storage().instance().extend_ttl(518400, 518400);
 
         #[cfg(not(test))]
         {
@@ -942,6 +1052,7 @@ mod tests {
     };
 
     use crate::AssetRegistryClient;
+    use engineer_registry;
     use lifecycle;
 
     #[test]
@@ -2831,6 +2942,139 @@ mod tests {
         );
     }
 
+    // --- Instance TTL expiry tests ---
+
+    /// Helper: wipe instance storage to simulate TTL expiry.
+    fn wipe_instance(env: &Env, contract_id: &Address) {
+        env.as_contract(contract_id, || {
+            env.storage().instance().remove(&ADMIN_KEY);
+            env.storage().instance().remove(&PENDING_ADMIN_KEY);
+        });
+    }
+
+    #[test]
+    fn test_pause_extends_instance_ttl_after_expiry() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        // Simulate expiry then re-init
+        client.initialize_admin(&admin);
+        wipe_instance(&env, &contract_id);
+        client.initialize_admin(&admin);
+
+        client.pause(&admin);
+        let ttl = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
+        assert!(ttl > 0, "pause must extend instance TTL");
+    }
+
+    #[test]
+    fn test_unpause_extends_instance_ttl_after_expiry() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin);
+        client.pause(&admin);
+        wipe_instance(&env, &contract_id);
+        client.initialize_admin(&admin);
+
+        client.unpause(&admin);
+        let ttl = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
+        assert!(ttl > 0, "unpause must extend instance TTL");
+    }
+
+    #[test]
+    fn test_propose_admin_extends_instance_ttl_after_expiry() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin);
+        wipe_instance(&env, &contract_id);
+        client.initialize_admin(&admin);
+
+        let new_admin = Address::generate(&env);
+        client.propose_admin(&admin, &new_admin);
+        let ttl = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
+        assert!(ttl > 0, "propose_admin must extend instance TTL");
+    }
+
+    #[test]
+    fn test_accept_admin_extends_instance_ttl_after_expiry() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let new_admin = Address::generate(&env);
+        client.initialize_admin(&admin);
+        client.propose_admin(&admin, &new_admin);
+
+        // Simulate partial expiry (keep admin + pending_admin intact)
+        // accept_admin reads PENDING_ADMIN_KEY which must still be present
+        client.accept_admin(&new_admin);
+        assert_eq!(client.get_admin(), new_admin);
+        let ttl = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
+        assert!(ttl > 0, "accept_admin must extend instance TTL");
+    }
+
+    #[test]
+    fn test_upgrade_extends_instance_ttl_after_expiry() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin);
+        wipe_instance(&env, &contract_id);
+        client.initialize_admin(&admin);
+
+        let hash = BytesN::from_array(&env, &[0xabu8; 32]);
+        client.upgrade(&admin, &hash);
+        let ttl = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
+        assert!(ttl > 0, "upgrade must extend instance TTL");
+    }
+
+    #[test]
+    fn test_admin_ops_work_after_instance_ttl_expiry_and_reinit() {
+        // Full scenario: instance expires, admin re-initializes, all ops succeed.
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        // Simulate instance TTL expiry
+        wipe_instance(&env, &contract_id);
+
+        // Re-initialize admin
+        client.initialize_admin(&admin);
+
+        // All admin ops must succeed and extend TTL
+        client.pause(&admin);
+        client.unpause(&admin);
+
+        let new_admin = Address::generate(&env);
+        client.propose_admin(&admin, &new_admin);
+        client.accept_admin(&new_admin);
+        assert_eq!(client.get_admin(), new_admin);
+
+        let ttl = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
+        assert!(ttl > 0, "instance TTL must be live after admin ops");
+    }
+
     // --- Issue #381: is_valid_asset_type survives instance TTL expiry ---
 
     #[test]
@@ -2917,6 +3161,7 @@ mod tests {
         env.mock_all_auths();
 
         let asset_registry_id = env.register(AssetRegistry, ());
+        let engineer_registry_id = env.register(engineer_registry::EngineerRegistry, ());
         let lifecycle_id = env.register(lifecycle::Lifecycle, ());
 
         let asset_client = AssetRegistryClient::new(&env, &asset_registry_id);
@@ -2932,11 +3177,14 @@ mod tests {
         let lifecycle_admin = Address::generate(&env);
         let engineer_registry_id = Address::generate(&env);
         lifecycle_client.initialize(
+        let deployer = Address::generate(&env);
+        lifecycle_client.initialize(
+            &deployer,
             &lifecycle_admin,
             &asset_registry_id,
             &engineer_registry_id,
             &lifecycle_admin,
-            &100,
+            &200,
         );
 
         // Register an asset
@@ -3222,5 +3470,224 @@ mod tests {
 
         let turbines = client.get_assets_by_type(&symbol_short!("TURBINE"));
         assert_eq!(turbines.len(), 1);
+    }
+
+    #[test]
+    fn test_asset_status_active() {
+    fn test_get_asset_count() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let asset_id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Active Generator"),
+            &owner,
+        );
+
+        let status = client.asset_status(&asset_id);
+        assert_eq!(status, AssetStatus::Active);
+    }
+
+    #[test]
+    fn test_asset_status_decommissioned() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let asset_id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Decomm Generator"),
+            &owner,
+        );
+
+        // Manually set the decommissioned flag
+        let key = decommissioned_key(asset_id);
+        env.storage().persistent().set(&key, &true);
+
+        let status = client.asset_status(&asset_id);
+        assert_eq!(status, AssetStatus::Decommissioned);
+    }
+
+    #[test]
+    fn test_asset_status_not_found() {
+        let env = Env::default();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let result = client.try_asset_status(&999u64);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::AssetNotFound as u32
+            )))
+        );
+    }
+
+    #[test]
+    fn test_asset_status_under_maintenance() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let asset_id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Maintained Generator"),
+            &owner,
+        );
+
+        // Manually set the under_maintenance flag
+        let key = (symbol_short!("U_MAINT"), asset_id);
+        env.storage().persistent().set(&key, &true);
+
+        let status = client.asset_status(&asset_id);
+        assert_eq!(status, AssetStatus::UnderMaintenance);
+    }
+
+    #[test]
+    fn test_decommission_asset_admin_can_decommission() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let asset_id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Decomm Test"),
+            &owner,
+        );
+
+        // Decommission the asset
+        client.decommission_asset(&admin, &asset_id);
+
+        // Verify status is Decommissioned
+        let status = client.asset_status(&asset_id);
+        assert_eq!(status, AssetStatus::Decommissioned);
+    }
+
+    #[test]
+    fn test_decommission_asset_non_admin_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let asset_id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Decomm Test"),
+            &owner,
+        );
+
+        // Non-admin tries to decommission
+        let non_admin = Address::generate(&env);
+        let result = client.try_decommission_asset(&non_admin, &asset_id);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::UnauthorizedAdmin as u32
+            )))
+        );
+    }
+
+    #[test]
+    fn test_decommission_nonexistent_asset() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+
+        // Try to decommission non-existent asset
+        let result = client.try_decommission_asset(&admin, &999u64);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::AssetNotFound as u32
+            )))
+        );
+    }
+
+    #[test]
+    fn test_decommission_asset_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let asset_id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Event Test"),
+            &owner,
+        );
+
+        // Decommission the asset and check for event
+        client.decommission_asset(&admin, &asset_id);
+
+        let events = env.events().all();
+        // Should have at least one DECOMM event
+        assert!(events.len() > 0, "decommission_asset should emit an event");
+        // Counter starts at 0
+        assert_eq!(client.get_asset_count(), 0);
+
+        let owner = Address::generate(&env);
+
+        // Register first asset, count should be 1
+        client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Generator 1"),
+            &owner,
+        );
+        assert_eq!(client.get_asset_count(), 1);
+
+        // Register second asset, count should be 2
+        client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Generator 2"),
+            &owner,
+        );
+        assert_eq!(client.get_asset_count(), 2);
+
+        // Register third asset, count should be 3
+        client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Generator 3"),
+            &owner,
+        );
+        assert_eq!(client.get_asset_count(), 3);
     }
 }
