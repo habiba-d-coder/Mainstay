@@ -1038,6 +1038,32 @@ mod tests {
     }
 
     #[test]
+    fn test_register_asset_duplicate_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let metadata = String::from_str(&env, "CAT-3516-DUPLICATE");
+
+        let id = client.register_asset(&symbol_short!("GENSET"), &metadata, &owner);
+        assert_eq!(id, 1);
+
+        let result = client.try_register_asset(&symbol_short!("GENSET"), &metadata, &owner);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::DuplicateAsset as u32
+            )))
+        );
+    }
+
+    #[test]
     fn test_different_owners_same_metadata_allowed() {
         let env = Env::default();
         env.mock_all_auths();
