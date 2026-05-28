@@ -503,6 +503,14 @@ impl AssetRegistry {
         env.storage().persistent().get(&ASSET_COUNT).unwrap_or(0)
     }
 
+    /// Get the total count of registered assets.
+    ///
+    /// # Returns
+    /// The total number of assets that have been registered
+    pub fn get_asset_count(env: Env) -> u64 {
+        env.storage().persistent().get(&ASSET_COUNT).unwrap_or(0)
+    }
+
     /// Returns all asset IDs of the given type.
     pub fn get_assets_by_type(env: Env, asset_type: Symbol) -> Vec<u64> {
         let key = type_assets_key(&asset_type);
@@ -598,6 +606,7 @@ impl AssetRegistry {
             panic_with_error!(&env, ContractError::PendingAdminAlreadyExists);
         }
         env.storage().instance().set(&PENDING_ADMIN_KEY, &new_admin);
+        env.storage().instance().extend_ttl(518400, 518400);
         env.events()
             .publish((symbol_short!("PROP_ADM"),), (admin, new_admin));
     }
@@ -623,6 +632,7 @@ impl AssetRegistry {
         }
         env.storage().instance().set(&ADMIN_KEY, &pending_admin);
         env.storage().instance().remove(&PENDING_ADMIN_KEY);
+        env.storage().instance().extend_ttl(518400, 518400);
         env.events()
             .publish((symbol_short!("ADMIN_SET"),), (pending_admin,));
     }
@@ -921,6 +931,8 @@ impl AssetRegistry {
             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
         }
 
+        env.storage().instance().extend_ttl(518400, 518400);
+
         #[cfg(not(test))]
         {
             env.deployer()
@@ -1040,6 +1052,8 @@ mod tests {
     };
 
     use crate::AssetRegistryClient;
+    use engineer_registry;
+    use lifecycle;
 
     #[test]
     fn test_register_and_get_asset() {
@@ -1213,7 +1227,7 @@ mod tests {
         let client = AssetRegistryClient::new(&env, &contract_id);
 
         let admin = Address::generate(&env);
-        client.initialize_admin(&admin);
+        client.initialize_admin(&admin, &admin);
         client.add_asset_type(&admin, &symbol_short!("GENSET"));
 
         let owner = Address::generate(&env);
@@ -1934,7 +1948,7 @@ mod tests {
         let client = AssetRegistryClient::new(&env, &contract_id);
 
         let admin = Address::generate(&env);
-        client.initialize_admin(&admin);
+        client.initialize_admin(&admin, &admin);
         client.add_asset_type(&admin, &symbol_short!("GENSET"));
 
         let owner = Address::generate(&env);
@@ -2917,6 +2931,139 @@ mod tests {
         );
     }
 
+    // --- Instance TTL expiry tests ---
+
+    /// Helper: wipe instance storage to simulate TTL expiry.
+    fn wipe_instance(env: &Env, contract_id: &Address) {
+        env.as_contract(contract_id, || {
+            env.storage().instance().remove(&ADMIN_KEY);
+            env.storage().instance().remove(&PENDING_ADMIN_KEY);
+        });
+    }
+
+    #[test]
+    fn test_pause_extends_instance_ttl_after_expiry() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        // Simulate expiry then re-init
+        client.initialize_admin(&admin);
+        wipe_instance(&env, &contract_id);
+        client.initialize_admin(&admin);
+
+        client.pause(&admin);
+        let ttl = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
+        assert!(ttl > 0, "pause must extend instance TTL");
+    }
+
+    #[test]
+    fn test_unpause_extends_instance_ttl_after_expiry() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin);
+        client.pause(&admin);
+        wipe_instance(&env, &contract_id);
+        client.initialize_admin(&admin);
+
+        client.unpause(&admin);
+        let ttl = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
+        assert!(ttl > 0, "unpause must extend instance TTL");
+    }
+
+    #[test]
+    fn test_propose_admin_extends_instance_ttl_after_expiry() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin);
+        wipe_instance(&env, &contract_id);
+        client.initialize_admin(&admin);
+
+        let new_admin = Address::generate(&env);
+        client.propose_admin(&admin, &new_admin);
+        let ttl = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
+        assert!(ttl > 0, "propose_admin must extend instance TTL");
+    }
+
+    #[test]
+    fn test_accept_admin_extends_instance_ttl_after_expiry() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let new_admin = Address::generate(&env);
+        client.initialize_admin(&admin);
+        client.propose_admin(&admin, &new_admin);
+
+        // Simulate partial expiry (keep admin + pending_admin intact)
+        // accept_admin reads PENDING_ADMIN_KEY which must still be present
+        client.accept_admin(&new_admin);
+        assert_eq!(client.get_admin(), new_admin);
+        let ttl = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
+        assert!(ttl > 0, "accept_admin must extend instance TTL");
+    }
+
+    #[test]
+    fn test_upgrade_extends_instance_ttl_after_expiry() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin);
+        wipe_instance(&env, &contract_id);
+        client.initialize_admin(&admin);
+
+        let hash = BytesN::from_array(&env, &[0xabu8; 32]);
+        client.upgrade(&admin, &hash);
+        let ttl = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
+        assert!(ttl > 0, "upgrade must extend instance TTL");
+    }
+
+    #[test]
+    fn test_admin_ops_work_after_instance_ttl_expiry_and_reinit() {
+        // Full scenario: instance expires, admin re-initializes, all ops succeed.
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        // Simulate instance TTL expiry
+        wipe_instance(&env, &contract_id);
+
+        // Re-initialize admin
+        client.initialize_admin(&admin);
+
+        // All admin ops must succeed and extend TTL
+        client.pause(&admin);
+        client.unpause(&admin);
+
+        let new_admin = Address::generate(&env);
+        client.propose_admin(&admin, &new_admin);
+        client.accept_admin(&new_admin);
+        assert_eq!(client.get_admin(), new_admin);
+
+        let ttl = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
+        assert!(ttl > 0, "instance TTL must be live after admin ops");
+    }
+
     // --- Issue #381: is_valid_asset_type survives instance TTL expiry ---
 
     #[test]
@@ -3003,6 +3150,7 @@ mod tests {
         env.mock_all_auths();
 
         let asset_registry_id = env.register(AssetRegistry, ());
+        let engineer_registry_id = env.register(engineer_registry::EngineerRegistry, ());
         let lifecycle_id = env.register(lifecycle::Lifecycle, ());
 
         let asset_client = AssetRegistryClient::new(&env, &asset_registry_id);
@@ -3012,15 +3160,18 @@ mod tests {
         let asset_owner = Address::generate(&env);
 
         // Initialize both contracts
-        asset_client.initialize_admin(&admin);
+        asset_client.initialize_admin(&admin, &admin);
         asset_client.add_asset_type(&admin, &symbol_short!("GENSET"));
 
         let lifecycle_admin = Address::generate(&env);
+        let deployer = Address::generate(&env);
         lifecycle_client.initialize(
-            &asset_registry_id,
-            &Address::generate(&env),
+            &deployer,
             &lifecycle_admin,
-            &100,
+            &asset_registry_id,
+            &engineer_registry_id,
+            &lifecycle_admin,
+            &200,
         );
 
         // Register an asset
@@ -3048,7 +3199,7 @@ mod tests {
         let asset_client = AssetRegistryClient::new(&env, &asset_registry_id);
 
         let admin = Address::generate(&env);
-        asset_client.initialize_admin(&admin);
+        asset_client.initialize_admin(&admin, &admin);
 
         // Try to get lifecycle score for non-existent asset
         let result = asset_client.try_get_lifecycle_score(&999, &lifecycle_id);
@@ -3082,7 +3233,7 @@ mod tests {
         // then verify get_admin still returns the correct admin
         env.ledger().with_mut(|li| {
             li.sequence_number += TTL_THRESHOLD;
-            li.timestamp += TTL_THRESHOLD * 5;
+            li.timestamp += (TTL_THRESHOLD as u64) * 5;
         });
 
         // get_admin must still resolve correctly (TTL was extended at init time)
@@ -3174,7 +3325,7 @@ mod tests {
         let contract_id = env.register(AssetRegistry, ());
         let client = AssetRegistryClient::new(env, &contract_id);
         let admin = Address::generate(env);
-        client.initialize_admin(&admin);
+        client.initialize_admin(&admin, &admin);
         client.add_asset_type(&admin, &symbol_short!("GENSET"));
         client.add_asset_type(&admin, &symbol_short!("TURBINE"));
         (client, admin, Address::generate(env))
@@ -3310,6 +3461,7 @@ mod tests {
 
     #[test]
     fn test_asset_status_active() {
+    fn test_get_asset_count() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register(AssetRegistry, ());
@@ -3496,5 +3648,33 @@ mod tests {
         let events = env.events().all();
         // Should have at least one DECOMM event
         assert!(events.len() > 0, "decommission_asset should emit an event");
+        // Counter starts at 0
+        assert_eq!(client.get_asset_count(), 0);
+
+        let owner = Address::generate(&env);
+
+        // Register first asset, count should be 1
+        client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Generator 1"),
+            &owner,
+        );
+        assert_eq!(client.get_asset_count(), 1);
+
+        // Register second asset, count should be 2
+        client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Generator 2"),
+            &owner,
+        );
+        assert_eq!(client.get_asset_count(), 2);
+
+        // Register third asset, count should be 3
+        client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Generator 3"),
+            &owner,
+        );
+        assert_eq!(client.get_asset_count(), 3);
     }
 }
