@@ -49,6 +49,7 @@ fn engineer_key(addr: &Address) -> (Symbol, Address) {
 }
 
 const PAUSED_KEY: Symbol = symbol_short!("PAUSED");
+const ENGINEER_COUNT: Symbol = symbol_short!("ENG_CNT");
 const REG_ENG_TOPIC: Symbol = symbol_short!("REG_ENG");
 const REVOKE_TOPIC: Symbol = symbol_short!("REV_CRED");
 const MIN_VALIDITY_PERIOD: u64 = 86_400;
@@ -176,27 +177,41 @@ impl EngineerRegistry {
             .persistent()
             .extend_ttl(&issuer_engineers_key(&issuer), TTL_THRESHOLD, TTL_TARGET);
 
+        // Increment engineer count
+        let count: u32 = env.storage().persistent().get(&ENGINEER_COUNT).unwrap_or(0);
+        env.storage().persistent().set(&ENGINEER_COUNT, &(count + 1));
+        env.storage()
+            .persistent()
+            .extend_ttl(&ENGINEER_COUNT, TTL_THRESHOLD, TTL_TARGET);
+
         // Emit engineer registration event
         env.events().publish(
-            (REG_ENG_TOPIC, engineer.clone()),
-            (issuer, credential_hash.clone(), now, now + validity_period),
+            (symbol_short!("reg_eng"),),
+            (
+                engineer.clone(),
+                credential_hash.clone(),
+                issuer.clone(),
+                now,
+            ),
         );
     }
 
     /// Verify if an engineer has valid, active credentials.
-    /// Checks both active status and expiration time.
+    /// Checks both active status and expiration time, distinguishing between
+    /// a never-registered engineer and a revoked/expired one.
     ///
     /// # Arguments
     /// * `engineer` - The address of the engineer to verify
     ///
     /// # Returns
-    /// `true` if the engineer has valid, non-expired credentials; `false` otherwise
-    pub fn verify_engineer(env: Env, engineer: Address) -> bool {
+    /// `Some(true)` if the engineer has valid, non-expired credentials;
+    /// `Some(false)` if the engineer exists but is revoked or expired;
+    /// `None` if the engineer was never registered
+    pub fn verify_engineer(env: Env, engineer: Address) -> Option<bool> {
         env.storage()
             .persistent()
             .get::<_, Engineer>(&engineer_key(&engineer))
             .map(|e| e.active && env.ledger().timestamp() < e.expires_at)
-            .unwrap_or(false)
     }
 
     /// Verify multiple engineers in a single call.
@@ -247,6 +262,8 @@ impl EngineerRegistry {
         if !record.active {
             panic_with_error!(&env, ContractError::CredentialAlreadyRevoked);
         }
+        let credential_hash = record.credential_hash.clone();
+        let revoked_by = record.issuer.clone();
         // Extend TTL before write to ensure consistency even on near-expired entries
         env.storage()
             .persistent()
@@ -257,9 +274,10 @@ impl EngineerRegistry {
             .set(&engineer_key(&engineer), &record);
 
         // Emit credential revocation event
+        let timestamp = env.ledger().timestamp();
         env.events().publish(
-            (REVOKE_TOPIC, engineer.clone()),
-            (record.issuer.clone(), env.ledger().timestamp()),
+            (symbol_short!("revoke"),),
+            (engineer.clone(), credential_hash, revoked_by, timestamp),
         );
     }
 
@@ -640,6 +658,14 @@ impl EngineerRegistry {
         Self::get_engineers_by_issuer(env, issuer).len()
     }
 
+    /// Get the total count of registered engineers.
+    ///
+    /// # Returns
+    /// The total number of engineers that have been registered
+    pub fn get_engineer_count(env: Env) -> u32 {
+        env.storage().persistent().get(&ENGINEER_COUNT).unwrap_or(0)
+    }
+
     /// Admin-only function to upgrade the contract WASM to a new hash.
     pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) {
         ensure_not_paused(&env);
@@ -734,26 +760,25 @@ mod tests {
         let issued_at = env.ledger().timestamp();
         client.register_engineer(&engineer, &hash, &issuer, &validity_period);
 
-        // ISS_ADD event fires first, REG_ENG is the second event
+        // ISS_ADD event fires first, reg_eng is the second event
         let events = env.events().all();
         let (_, topics, data) = events.last().unwrap();
 
         use soroban_sdk::TryIntoVal;
+        let reg_topic = symbol_short!("reg_eng");
         let t0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
-        let t1: Address = topics.get(1).unwrap().try_into_val(&env).unwrap();
-        assert_eq!(t0, REG_ENG_TOPIC);
-        assert_eq!(t1, engineer);
+        assert_eq!(t0, reg_topic);
 
-        let (emitted_issuer, emitted_hash, emitted_issued_at, emitted_expires_at): (
-            Address,
-            BytesN<32>,
-            u64,
-            u64,
-        ) = data.try_into_val(&env).unwrap();
-        assert_eq!(emitted_issuer, issuer);
+        let (
+            emitted_engineer,
+            emitted_hash,
+            emitted_issuer,
+            emitted_timestamp,
+        ): (Address, BytesN<32>, Address, u64) = data.try_into_val(&env).unwrap();
+        assert_eq!(emitted_engineer, engineer);
         assert_eq!(emitted_hash, hash);
-        assert_eq!(emitted_issued_at, issued_at);
-        assert_eq!(emitted_expires_at, issued_at + validity_period);
+        assert_eq!(emitted_issuer, issuer);
+        assert_eq!(emitted_timestamp, issued_at);
     }
 
     #[test]
@@ -776,13 +801,19 @@ mod tests {
         let (_, topics, data) = events.last().unwrap();
 
         use soroban_sdk::TryIntoVal;
+        let revoke_topic = symbol_short!("revoke");
         let t0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
-        let t1: Address = topics.get(1).unwrap().try_into_val(&env).unwrap();
-        assert_eq!(t0, REVOKE_TOPIC);
-        assert_eq!(t1, engineer);
+        assert_eq!(t0, revoke_topic);
 
-        let (emitted_issuer, emitted_timestamp): (Address, u64) = data.try_into_val(&env).unwrap();
-        assert_eq!(emitted_issuer, issuer);
+        let (
+            emitted_engineer,
+            emitted_hash,
+            emitted_revoked_by,
+            emitted_timestamp,
+        ): (Address, BytesN<32>, Address, u64) = data.try_into_val(&env).unwrap();
+        assert_eq!(emitted_engineer, engineer);
+        assert_eq!(emitted_hash, hash);
+        assert_eq!(emitted_revoked_by, issuer);
         assert_eq!(emitted_timestamp, revoked_at);
     }
 
@@ -2515,5 +2546,82 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert!(!results.get(0).unwrap());
         assert!(!results.get(1).unwrap());
+    }
+
+    #[test]
+    fn test_get_engineer_count() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let issuer = Address::generate(&env);
+        client.add_trusted_issuer(&admin, &issuer);
+
+        // Counter starts at 0
+        assert_eq!(client.get_engineer_count(), 0);
+
+        // Register first engineer, count should be 1
+        let engineer1 = Address::generate(&env);
+        let hash1 = BytesN::from_array(&env, &[1u8; 32]);
+        client.register_engineer(&engineer1, &hash1, &issuer, &31_536_000);
+        assert_eq!(client.get_engineer_count(), 1);
+
+        // Register second engineer, count should be 2
+        let engineer2 = Address::generate(&env);
+        let hash2 = BytesN::from_array(&env, &[2u8; 32]);
+        client.register_engineer(&engineer2, &hash2, &issuer, &31_536_000);
+        assert_eq!(client.get_engineer_count(), 2);
+
+        // Register third engineer, count should be 3
+        let engineer3 = Address::generate(&env);
+        let hash3 = BytesN::from_array(&env, &[3u8; 32]);
+        client.register_engineer(&engineer3, &hash3, &issuer, &31_536_000);
+        assert_eq!(client.get_engineer_count(), 3);
+    fn test_verify_engineer_distinguishes_not_found_from_revoked() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(EngineerRegistry, ());
+        let client = EngineerRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        client.initialize_admin(&admin);
+        client.add_trusted_issuer(&admin, &issuer);
+
+        let engineer = Address::generate(&env);
+        let never_registered = Address::generate(&env);
+
+        // Never-registered engineer returns None
+        assert_eq!(
+            client.verify_engineer(&never_registered),
+            None,
+            "never-registered engineer should return None"
+        );
+
+        // Register an engineer
+        client.register_engineer(&engineer, &BytesN::from_array(&env, &[1u8; 32]), &issuer, &31_536_000);
+
+        // Active engineer returns Some(true)
+        assert_eq!(
+            client.verify_engineer(&engineer),
+            Some(true),
+            "active engineer should return Some(true)"
+        );
+
+        // Revoke the engineer
+        client.revoke_credential(&engineer);
+
+        // Revoked engineer returns Some(false)
+        assert_eq!(
+            client.verify_engineer(&engineer),
+            Some(false),
+            "revoked engineer should return Some(false)"
+        );
+
+        // Never-registered still returns None
+        assert_eq!(
+            client.verify_engineer(&never_registered),
+            None,
+            "never-registered engineer should still return None after other operations"
+        );
     }
 }
