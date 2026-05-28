@@ -105,7 +105,7 @@ impl EngineerRegistry {
     ///
     /// # Arguments
     /// * `engineer` - The address of the engineer being registered
-    /// * `credential_hash` - Hash of the engineer's credentials/certifications
+    /// * `credential_hash` - SHA-256 hash of the engineer's credentials (32 bytes; as hex string: 64 characters)
     /// * `issuer` - The trusted issuer address registering the engineer
     /// * `validity_period` - Duration in seconds for which the credentials are valid
     ///
@@ -192,19 +192,21 @@ impl EngineerRegistry {
     }
 
     /// Verify if an engineer has valid, active credentials.
-    /// Checks both active status and expiration time.
+    /// Checks both active status and expiration time, distinguishing between
+    /// a never-registered engineer and a revoked/expired one.
     ///
     /// # Arguments
     /// * `engineer` - The address of the engineer to verify
     ///
     /// # Returns
-    /// `true` if the engineer has valid, non-expired credentials; `false` otherwise
-    pub fn verify_engineer(env: Env, engineer: Address) -> bool {
+    /// `Some(true)` if the engineer has valid, non-expired credentials;
+    /// `Some(false)` if the engineer exists but is revoked or expired;
+    /// `None` if the engineer was never registered
+    pub fn verify_engineer(env: Env, engineer: Address) -> Option<bool> {
         env.storage()
             .persistent()
             .get::<_, Engineer>(&engineer_key(&engineer))
             .map(|e| e.active && env.ledger().timestamp() < e.expires_at)
-            .unwrap_or(false)
     }
 
     /// Verify multiple engineers in a single call.
@@ -419,6 +421,7 @@ impl EngineerRegistry {
         env.storage()
             .instance()
             .set(&pending_admin_key(), &new_admin);
+        env.storage().instance().extend_ttl(518400, 518400);
         env.events()
             .publish((EVENT_PROP_ADMIN,), (admin, new_admin));
     }
@@ -438,6 +441,7 @@ impl EngineerRegistry {
         pending_admin.require_auth();
         env.storage().instance().set(&admin_key(), &pending_admin);
         env.storage().instance().remove(&pending_admin_key());
+        env.storage().instance().extend_ttl(518400, 518400);
         env.events()
             .publish((symbol_short!("ADMIN_SET"),), (pending_admin,));
     }
@@ -667,6 +671,8 @@ impl EngineerRegistry {
         if stored_admin != admin {
             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
         }
+
+        env.storage().instance().extend_ttl(518400, 518400);
 
         env.events().publish(
             (symbol_short!("UPGRADE"), admin.clone()),
@@ -2131,6 +2137,27 @@ mod tests {
     }
 
     #[test]
+    fn test_register_engineer_rejects_invalid_credential_hash() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let invalid_hash = BytesN::from_array(&env, &[0u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer);
+
+        let result = client.try_register_engineer(&engineer, &invalid_hash, &issuer, &31_536_000);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::InvalidCredentialHash as u32,
+            ))),
+        );
+    }
+
+    #[test]
     fn test_no_duplicate_in_issuer_list_after_reregistration() {
         let env = Env::default();
         env.mock_all_auths();
@@ -2537,5 +2564,51 @@ mod tests {
         let hash3 = BytesN::from_array(&env, &[3u8; 32]);
         client.register_engineer(&engineer3, &hash3, &issuer, &31_536_000);
         assert_eq!(client.get_engineer_count(), 3);
+    fn test_verify_engineer_distinguishes_not_found_from_revoked() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(EngineerRegistry, ());
+        let client = EngineerRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        client.initialize_admin(&admin);
+        client.add_trusted_issuer(&admin, &issuer);
+
+        let engineer = Address::generate(&env);
+        let never_registered = Address::generate(&env);
+
+        // Never-registered engineer returns None
+        assert_eq!(
+            client.verify_engineer(&never_registered),
+            None,
+            "never-registered engineer should return None"
+        );
+
+        // Register an engineer
+        client.register_engineer(&engineer, &BytesN::from_array(&env, &[1u8; 32]), &issuer, &31_536_000);
+
+        // Active engineer returns Some(true)
+        assert_eq!(
+            client.verify_engineer(&engineer),
+            Some(true),
+            "active engineer should return Some(true)"
+        );
+
+        // Revoke the engineer
+        client.revoke_credential(&engineer);
+
+        // Revoked engineer returns Some(false)
+        assert_eq!(
+            client.verify_engineer(&engineer),
+            Some(false),
+            "revoked engineer should return Some(false)"
+        );
+
+        // Never-registered still returns None
+        assert_eq!(
+            client.verify_engineer(&never_registered),
+            None,
+            "never-registered engineer should still return None after other operations"
+        );
     }
 }
