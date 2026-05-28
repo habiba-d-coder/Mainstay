@@ -3,27 +3,44 @@ target/
 
 # Environment secrets
 .env
+.env.local
+.env.*.local
 
 # Test snapshots
 contracts/asset-registry/test_snapshots/
 contracts/lifecycle/test_snapshots/
 contracts/engineer-registry/test_snapshots/
+**/test_snapshots/
 **/*.snap
 
 # IDE / editor
 .vscode/
 .idea/
 *.iml
+*.swp
+*.swo
+*~
 
 # OS
 .DS_Store
+.DS_Store?
 Thumbs.db
+ehthumbs.db
 
 # Logs
 *.log
+logs/
 
 # Wasm build output
 *.wasm
 
 # Rust
 Cargo.lock
+
+# Soroban / Stellar CLI artifacts
+.soroban/
+stellar-cli-output/
+
+# Temporary files
+*.tmp
+*.bak
