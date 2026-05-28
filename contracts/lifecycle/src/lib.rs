@@ -1,5 +1,8 @@
 #![no_std]
 
+use shared::validation::{
+    require_non_empty_vec, require_positive_u32, require_positive_u64, require_string_length,
+};
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, Address,
     BytesN, Env, String, Symbol, Vec,
@@ -126,7 +129,9 @@ fn score_history_push(env: &Env, asset_id: u64, entry: ScoreEntry, max_history: 
     }
     history.push_back(entry);
     env.storage().persistent().set(&key, &history);
-    env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
 }
 
 fn last_update_key(asset_id: u64) -> (Symbol, u64) {
@@ -177,7 +182,9 @@ fn engineer_history_add(env: &Env, engineer: &Address, asset_id: u64, max_histor
     }
 
     env.storage().persistent().set(&key, &ids);
-    env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
 }
 
 fn engineer_history_remove(env: &Env, engineer: &Address, asset_id: u64) {
@@ -193,7 +200,9 @@ fn engineer_history_remove(env: &Env, engineer: &Address, asset_id: u64) {
         if let Some(i) = index {
             ids.remove(i);
             env.storage().persistent().set(&key, &ids);
-            env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
         }
     }
 }
@@ -319,9 +328,11 @@ fn apply_decay(
 
     if current_score == 0 {
         if env.storage().persistent().has(&last_update_key(asset_id)) {
-            env.storage()
-                .persistent()
-                .extend_ttl(&last_update_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
+            env.storage().persistent().extend_ttl(
+                &last_update_key(asset_id),
+                TTL_THRESHOLD,
+                TTL_TARGET,
+            );
         }
         return 0;
     }
@@ -347,9 +358,11 @@ fn apply_decay(
         env.storage()
             .persistent()
             .extend_ttl(&score_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
-        env.storage()
-            .persistent()
-            .extend_ttl(&last_update_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
+        env.storage().persistent().extend_ttl(
+            &last_update_key(asset_id),
+            TTL_THRESHOLD,
+            TTL_TARGET,
+        );
         return current_score;
     }
 
@@ -417,6 +430,9 @@ fn get_task_weight(env: &Env, task_type: &Symbol) -> u32 {
 }
 
 fn validate_notes_length(env: &Env, notes: &soroban_sdk::String, max: u32) {
+    if notes.is_empty() {
+        panic_with_error!(env, ContractError::InvalidConfig);
+    }
     if notes.len() > max {
         panic_with_error!(env, ContractError::InvalidConfig);
     }
@@ -510,6 +526,9 @@ impl Lifecycle {
         deployer.require_auth();
         if env.storage().persistent().has(&CONFIG) {
             panic_with_error!(&env, ContractError::AlreadyInitialized);
+        }
+        if max_history > 10_000 {
+            panic_with_error!(&env, ContractError::InvalidConfig);
         }
         if asset_registry == engineer_registry {
             panic_with_error!(&env, ContractError::InvalidConfig);
@@ -673,6 +692,7 @@ impl Lifecycle {
         if score_increment == 0 {
             panic_with_error!(&env, ContractError::InvalidConfig);
         }
+        require_positive_u32(score_increment, "score_increment");
 
         let mut config: Config = env
             .storage()
@@ -714,6 +734,8 @@ impl Lifecycle {
         if decay_rate == 0 || decay_interval == 0 {
             panic_with_error!(&env, ContractError::InvalidConfig);
         }
+        require_positive_u32(decay_rate, "decay_rate");
+        require_positive_u64(decay_interval, "decay_interval");
 
         let mut config: Config = env
             .storage()
@@ -769,6 +791,7 @@ impl Lifecycle {
         if threshold == 0 {
             panic_with_error!(&env, ContractError::InvalidConfig);
         }
+        require_positive_u32(threshold, "threshold");
 
         let old_threshold = config.eligibility_threshold;
         config.eligibility_threshold = threshold;
@@ -804,6 +827,7 @@ impl Lifecycle {
         if new_max == 0 {
             panic_with_error!(&env, ContractError::InvalidConfig);
         }
+        require_positive_u32(new_max, "max_history");
 
         let mut config: Config = env
             .storage()
@@ -841,6 +865,7 @@ impl Lifecycle {
         if new_max == 0 {
             panic_with_error!(&env, ContractError::InvalidConfig);
         }
+        require_positive_u32(new_max, "max_notes_length");
 
         let mut config: Config = env
             .storage()
@@ -957,6 +982,16 @@ impl Lifecycle {
                 score: new_score,
             },
             config.max_history,
+        );
+
+        // Update last maintenance timestamp for decay tracking
+        env.storage()
+            .persistent()
+            .set(&last_update_key(asset_id), &timestamp);
+        env.storage().persistent().extend_ttl(
+            &last_update_key(asset_id),
+            TTL_THRESHOLD,
+            TTL_TARGET,
         );
 
         // Emit maintenance submission event
@@ -1080,7 +1115,9 @@ impl Lifecycle {
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
 
         // Validate records early before cross-contract calls
+        require_non_empty_vec(&records, "records");
         for record in records.iter() {
+            require_string_length(&record.notes, "notes", config.max_notes_length);
             validate_notes_length(&env, &record.notes, config.max_notes_length);
             // Validate task type is known
             let _ = get_task_weight(&env, &record.task_type);
@@ -1157,9 +1194,11 @@ impl Lifecycle {
         env.storage()
             .persistent()
             .set(&last_update_key(asset_id), &timestamp);
-        env.storage()
-            .persistent()
-            .extend_ttl(&last_update_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
+        env.storage().persistent().extend_ttl(
+            &last_update_key(asset_id),
+            TTL_THRESHOLD,
+            TTL_TARGET,
+        );
     }
 
     /// Apply time-based decay to an asset's collateral score.
@@ -1695,9 +1734,11 @@ impl Lifecycle {
         env.storage()
             .persistent()
             .set(&last_update_key(asset_id), &now);
-        env.storage()
-            .persistent()
-            .extend_ttl(&last_update_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
+        env.storage().persistent().extend_ttl(
+            &last_update_key(asset_id),
+            TTL_THRESHOLD,
+            TTL_TARGET,
+        );
         score_history_push(
             &env,
             asset_id,
@@ -1806,9 +1847,11 @@ impl Lifecycle {
                 env.storage()
                     .persistent()
                     .set(&score_history_key_val, &pruned);
-                env.storage()
-                    .persistent()
-                    .extend_ttl(&score_history_key_val, TTL_THRESHOLD, TTL_TARGET);
+                env.storage().persistent().extend_ttl(
+                    &score_history_key_val,
+                    TTL_THRESHOLD,
+                    TTL_TARGET,
+                );
             }
         }
 
@@ -3162,7 +3205,13 @@ mod tests {
         let admin = Address::generate(&env);
 
         let lifecycle = LifecycleClient::new(&env, &lifecycle_id);
-        lifecycle.initialize(&admin, &asset_registry_id, &engineer_registry_id, &admin, &0u32);
+        lifecycle.initialize(
+            &admin,
+            &asset_registry_id,
+            &engineer_registry_id,
+            &admin,
+            &0u32,
+        );
 
         let events = env.events().all();
         assert_eq!(events.len(), 1);
@@ -3179,11 +3228,22 @@ mod tests {
         let admin = Address::generate(&env);
 
         let lifecycle = LifecycleClient::new(&env, &lifecycle_id);
-        lifecycle.initialize(&admin, &asset_registry_id, &engineer_registry_id, &admin, &0u32);
+        lifecycle.initialize(
+            &admin,
+            &asset_registry_id,
+            &engineer_registry_id,
+            &admin,
+            &0u32,
+        );
 
         // Try to initialize again
-        let result =
-            lifecycle.try_initialize(&admin, &asset_registry_id, &engineer_registry_id, &admin, &0u32);
+        let result = lifecycle.try_initialize(
+            &admin,
+            &asset_registry_id,
+            &engineer_registry_id,
+            &admin,
+            &0u32,
+        );
         assert_eq!(
             result,
             Err(Ok(soroban_sdk::Error::from_contract_error(
@@ -5018,7 +5078,13 @@ mod tests {
         let admin = Address::generate(&env);
 
         let lifecycle = LifecycleClient::new(&env, &lifecycle_id);
-        lifecycle.initialize(&admin, &asset_registry_id, &engineer_registry_id, &admin, &0u32);
+        lifecycle.initialize(
+            &admin,
+            &asset_registry_id,
+            &engineer_registry_id,
+            &admin,
+            &0u32,
+        );
 
         // Verify registries are accessible normally
         assert_eq!(lifecycle.get_asset_registry(), asset_registry_id);
@@ -5786,7 +5852,13 @@ mod tests {
         let admin = Address::generate(&env);
 
         let client = LifecycleClient::new(&env, &lifecycle_id);
-        client.initialize(&admin, &asset_registry_id, &engineer_registry_id, &admin, &0u32);
+        client.initialize(
+            &admin,
+            &asset_registry_id,
+            &engineer_registry_id,
+            &admin,
+            &0u32,
+        );
 
         // Pause the contract
         client.pause(&admin);
@@ -6376,13 +6448,29 @@ mod tests {
             invoke: &soroban_sdk::testutils::MockAuthInvoke {
                 contract: &lifecycle_id,
                 fn_name: "initialize",
-                args: (&attacker, &asset_registry_id, &engineer_registry_id, &attacker, &0u32).into_val(&env),
+                args: (
+                    &attacker,
+                    &asset_registry_id,
+                    &engineer_registry_id,
+                    &attacker,
+                    &0u32,
+                )
+                    .into_val(&env),
                 sub_invokes: &[],
             },
         }]);
 
-        let result = client.try_initialize(&deployer, &asset_registry_id, &engineer_registry_id, &attacker, &0u32);
-        assert!(result.is_err(), "non-deployer must not be able to initialize");
+        let result = client.try_initialize(
+            &deployer,
+            &asset_registry_id,
+            &engineer_registry_id,
+            &attacker,
+            &0u32,
+        );
+        assert!(
+            result.is_err(),
+            "non-deployer must not be able to initialize"
+        );
     }
 
     /// An asset with a single maintenance record must never score 0, even after enough

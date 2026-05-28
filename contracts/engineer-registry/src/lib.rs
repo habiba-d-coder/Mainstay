@@ -1,4 +1,5 @@
 #![no_std]
+use shared::validation::require_within_bounds;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, Address,
     BytesN, Env, Symbol, Vec,
@@ -54,7 +55,6 @@ const REG_ENG_TOPIC: Symbol = symbol_short!("REG_ENG");
 const REVOKE_TOPIC: Symbol = symbol_short!("REV_CRED");
 const MIN_VALIDITY_PERIOD: u64 = 86_400;
 const EVENT_PROP_ADMIN: Symbol = symbol_short!("PROP_ADM");
-
 
 /// Soroban persistent-storage TTL constants.
 /// 1 ledger ≈ 5 seconds → 518_400 ledgers ≈ 30 days.
@@ -131,6 +131,12 @@ impl EngineerRegistry {
         if validity_period == 0 {
             panic_with_error!(&env, ContractError::InvalidValidityPeriod);
         }
+        require_within_bounds(
+            validity_period,
+            MIN_VALIDITY_PERIOD,
+            u64::MAX,
+            "validity_period",
+        );
 
         // Check if an engineer record already exists and is *not revoked*.
         // Re-registering would otherwise silently overwrite credentials.
@@ -173,9 +179,11 @@ impl EngineerRegistry {
         env.storage()
             .persistent()
             .set(&issuer_engineers_key(&issuer), &list);
-        env.storage()
-            .persistent()
-            .extend_ttl(&issuer_engineers_key(&issuer), TTL_THRESHOLD, TTL_TARGET);
+        env.storage().persistent().extend_ttl(
+            &issuer_engineers_key(&issuer),
+            TTL_THRESHOLD,
+            TTL_TARGET,
+        );
 
         // Increment engineer count
         let count: u32 = env.storage().persistent().get(&ENGINEER_COUNT).unwrap_or(0);
@@ -308,6 +316,12 @@ impl EngineerRegistry {
         if new_validity_period < MIN_VALIDITY_PERIOD {
             panic_with_error!(&env, ContractError::InvalidValidityPeriod);
         }
+        require_within_bounds(
+            new_validity_period,
+            MIN_VALIDITY_PERIOD,
+            u64::MAX,
+            "new_validity_period",
+        );
         let renewed_at = env.ledger().timestamp();
         let previous_expires_at = record.expires_at;
         let renewal_base = if previous_expires_at > renewed_at {
@@ -390,7 +404,9 @@ impl EngineerRegistry {
             panic_with_error!(&env, ContractError::AdminAlreadyInitialized);
         }
         env.storage().instance().set(&admin_key(), &admin);
-        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_TARGET);
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD, TTL_TARGET);
     }
 
     /// Get the current admin address of the contract.
@@ -548,11 +564,15 @@ impl EngineerRegistry {
         if !list.contains(issuer.clone()) {
             list.push_back(issuer.clone());
             env.storage().instance().set(&issuer_list_key(), &list);
-            env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_TARGET);
+            env.storage()
+                .instance()
+                .extend_ttl(TTL_THRESHOLD, TTL_TARGET);
             env.events()
                 .publish((symbol_short!("ISS_ADD"), admin), (issuer,));
         } else {
-            env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_TARGET);
+            env.storage()
+                .instance()
+                .extend_ttl(TTL_THRESHOLD, TTL_TARGET);
         }
     }
 
@@ -596,7 +616,9 @@ impl EngineerRegistry {
             }
         }
         env.storage().instance().set(&issuer_list_key(), &new_list);
-        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_TARGET);
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD, TTL_TARGET);
 
         // Revoke all active engineers registered by this issuer
         let engineers: Vec<Address> = env
@@ -612,9 +634,11 @@ impl EngineerRegistry {
             {
                 if record.active {
                     record.active = false;
-                    env.storage()
-                        .persistent()
-                        .extend_ttl(&engineer_key(&engineer), TTL_THRESHOLD, TTL_TARGET);
+                    env.storage().persistent().extend_ttl(
+                        &engineer_key(&engineer),
+                        TTL_THRESHOLD,
+                        TTL_TARGET,
+                    );
                     env.storage()
                         .persistent()
                         .set(&engineer_key(&engineer), &record);
@@ -2460,7 +2484,10 @@ mod tests {
         }]);
 
         let result = client.try_initialize_admin(&deployer, &attacker);
-        assert!(result.is_err(), "non-deployer must not be able to initialize");
+        assert!(
+            result.is_err(),
+            "non-deployer must not be able to initialize"
+        );
     }
 
     fn setup_engineer(
@@ -2521,9 +2548,9 @@ mod tests {
         let results =
             client.batch_verify_engineers(&soroban_sdk::vec![&env, active, revoked, unknown]);
         assert_eq!(results.len(), 3);
-        assert!(results.get(0).unwrap());   // active
-        assert!(!results.get(1).unwrap());  // revoked
-        assert!(!results.get(2).unwrap());  // not registered
+        assert!(results.get(0).unwrap()); // active
+        assert!(!results.get(1).unwrap()); // revoked
+        assert!(!results.get(2).unwrap()); // not registered
     }
 
     #[test]
