@@ -82,16 +82,18 @@ impl LendingContract {
             .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
     }
 
-    /// Repay the active loan for the caller. Panics with
-    /// [`ContractError::NoActiveLoan`] if no active loan exists.
+    /// Repay the active loan for the caller.
     ///
-    /// # #618: uses `panic_with_error!` instead of `expect` for structured errors.
+    /// # Errors
+    /// - [`ContractError::NoActiveLoan`] if no active loan exists for the
+    ///   borrower. Uses `panic_with_error!` for a structured contract error
+    ///   instead of a raw `expect` panic string (#618).
     pub fn repay(env: Env, borrower: Address) {
         borrower.require_auth();
 
         let key = loan_key(&borrower);
 
-        // #618: structured error instead of expect("no active loan")
+        // #618: structured error — replaces expect("no active loan")
         let mut loan: Loan = env
             .storage()
             .persistent()
