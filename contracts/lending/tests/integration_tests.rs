@@ -355,3 +355,113 @@ fn test_credit_score_zero_for_new_borrower() {
     let score = client.get_credit_score(&borrower);
     assert_eq!(score, 0);
 }
+
+#[test]
+fn test_initialize_with_custom_yield_rate() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(LendingContract, ());
+    let client = LendingContractClient::new(&env, &contract_id);
+
+    let deployer = Address::generate(&env);
+    let admin = Address::generate(&env);
+
+    let token_contract_id = env.register(token::Contract, ());
+    let token_client = token::Client::new(&env, &token_contract_id);
+
+    token_client.initialize(
+        &admin,
+        &18,
+        &String::from_str(&env, "Test Token"),
+        &String::from_str(&env, "TEST"),
+    );
+
+    let custom_yield_bps = 500;
+    client.initialize(&deployer, &admin, &token_contract_id, &custom_yield_bps);
+
+    let loan = client.get_loan(&admin);
+    assert!(loan.is_none());
+}
+
+#[test]
+fn test_repay_with_custom_yield_rate() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(LendingContract, ());
+    let client = LendingContractClient::new(&env, &contract_id);
+
+    let deployer = Address::generate(&env);
+    let admin = Address::generate(&env);
+
+    let token_contract_id = env.register(token::Contract, ());
+    let token_client = token::Client::new(&env, &token_contract_id);
+
+    token_client.initialize(
+        &admin,
+        &18,
+        &String::from_str(&env, "Test Token"),
+        &String::from_str(&env, "TEST"),
+    );
+
+    let custom_yield_bps = 500;
+    client.initialize(&deployer, &admin, &token_contract_id, &custom_yield_bps);
+
+    let borrower = Address::generate(&env);
+    let voucher = Address::generate(&env);
+
+    token_client.mint(&voucher, &10000);
+    token_client.mint(&env.current_contract_address(), &10000);
+
+    client.vouch(&borrower, &voucher, &1000);
+    client.request_loan(&borrower, &5000);
+
+    let voucher_balance_before = token_client.balance(&voucher);
+    client.repay(&borrower);
+    let voucher_balance_after = token_client.balance(&voucher);
+
+    let yield_received = voucher_balance_after - voucher_balance_before;
+    assert_eq!(yield_received, 5);
+}
+
+#[test]
+fn test_yield_rate_zero_bps() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(LendingContract, ());
+    let client = LendingContractClient::new(&env, &contract_id);
+
+    let deployer = Address::generate(&env);
+    let admin = Address::generate(&env);
+
+    let token_contract_id = env.register(token::Contract, ());
+    let token_client = token::Client::new(&env, &token_contract_id);
+
+    token_client.initialize(
+        &admin,
+        &18,
+        &String::from_str(&env, "Test Token"),
+        &String::from_str(&env, "TEST"),
+    );
+
+    let zero_yield_bps = 0;
+    client.initialize(&deployer, &admin, &token_contract_id, &zero_yield_bps);
+
+    let borrower = Address::generate(&env);
+    let voucher = Address::generate(&env);
+
+    token_client.mint(&voucher, &10000);
+    token_client.mint(&env.current_contract_address(), &10000);
+
+    client.vouch(&borrower, &voucher, &1000);
+    client.request_loan(&borrower, &5000);
+
+    let voucher_balance_before = token_client.balance(&voucher);
+    client.repay(&borrower);
+    let voucher_balance_after = token_client.balance(&voucher);
+
+    let yield_received = voucher_balance_after - voucher_balance_before;
+    assert_eq!(yield_received, 0);
+}
