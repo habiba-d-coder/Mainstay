@@ -27,6 +27,12 @@ pub enum ContractError {
     InsufficientFunds = 8,
     /// Stake is below the minimum required for non-zero yield (50 stroops).
     StakeBelowMinimum = 9,
+    /// Total stake summation overflowed i128.
+    StakeSummationOverflow = 10,
+    /// Admin address is invalid (zero address).
+    InvalidAdminAddress = 11,
+    /// Token address is invalid (zero address).
+    InvalidTokenAddress = 12,
 }
 
 #[contracttype]
@@ -53,6 +59,13 @@ pub struct Vouch {
     pub stake: u64,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Config {
+    pub yield_bps: u64,
+    pub slash_bps: u64,
+}
+
 const TTL_THRESHOLD: u32 = 518_400;
 const TTL_TARGET: u32 = 518_400;
 
@@ -75,6 +88,7 @@ const MIN_VOUCH_STAKE: u64 = 50;
 const ADMIN_KEY: soroban_sdk::Symbol = symbol_short!("ADMIN");
 const TOKEN_KEY: soroban_sdk::Symbol = symbol_short!("TOKEN");
 const SLASH_BAL: soroban_sdk::Symbol = symbol_short!("SL_BAL");
+const CONFIG_KEY: soroban_sdk::Symbol = symbol_short!("CONFIG");
 
 fn loan_key(borrower: &Address) -> (soroban_sdk::Symbol, Address) {
     (symbol_short!("LOAN"), borrower.clone())
@@ -96,6 +110,16 @@ fn get_token(env: &Env) -> Address {
         .persistent()
         .get(&TOKEN_KEY)
         .unwrap_or_else(|| panic_with_error!(env, ContractError::NotInitialized))
+}
+
+fn get_config(env: &Env) -> Config {
+    env.storage()
+        .persistent()
+        .get(&CONFIG_KEY)
+        .unwrap_or_else(|| Config {
+            yield_bps: 200,
+            slash_bps: 5000,
+        })
 }
 
 fn require_admin(env: &Env, caller: &Address) {
@@ -125,6 +149,14 @@ impl LendingContract {
             panic_with_error!(&env, ContractError::AlreadyInitialized);
         }
 
+        // #641: Validate admin and token addresses are not zero addresses.
+        if admin == Address::from_contract_id(&env, &[0u8; 32]) {
+            panic_with_error!(&env, ContractError::InvalidAdminAddress);
+        }
+        if token == Address::from_contract_id(&env, &[0u8; 32]) {
+            panic_with_error!(&env, ContractError::InvalidTokenAddress);
+        }
+
         env.storage().persistent().set(&ADMIN_KEY, &admin);
         env.storage()
             .persistent()
@@ -133,6 +165,12 @@ impl LendingContract {
         env.storage()
             .persistent()
             .extend_ttl(&TOKEN_KEY, TTL_THRESHOLD, TTL_TARGET);
+
+        // #640: Emit initialization event.
+        env.events().publish(
+            (symbol_short!("INIT"),),
+            (admin.clone(), token.clone()),
+        );
     }
 
     /// Request a new loan for the borrower.
@@ -189,16 +227,19 @@ impl LendingContract {
             .unwrap_or_else(|| Vec::new(&env));
 
         // #627: Pre-calculate total yield before touching any balances.
-        let mut total_yield: u64 = 0;
+        // #643: Use checked addition to prevent overflow.
+        let mut total_yield: i128 = 0;
         for v in vouches.iter() {
-            total_yield += v.stake * YIELD_NUMERATOR / YIELD_DENOMINATOR;
+            let yield_amount = (v.stake * YIELD_NUMERATOR / YIELD_DENOMINATOR) as i128;
+            total_yield = total_yield.checked_add(yield_amount)
+                .unwrap_or_else(|| panic_with_error!(&env, ContractError::StakeSummationOverflow));
         }
 
         // #627: Assert the contract holds enough tokens to cover every payout.
         let token_addr = get_token(&env);
         let tok = token::Client::new(&env, &token_addr);
         let contract_balance = tok.balance(&env.current_contract_address());
-        if contract_balance < (total_yield as i128) {
+        if contract_balance < total_yield {
             panic_with_error!(&env, ContractError::InsufficientFunds);
         }
 
@@ -381,5 +422,130 @@ impl LendingContract {
             .persistent()
             .get(&SLASH_BAL)
             .unwrap_or(0u64)
+    }
+
+    /// Admin-only: update yield and slash basis points.
+    pub fn update_config(env: Env, admin: Address, yield_bps: u64, slash_bps: u64) {
+        require_admin(&env, &admin);
+
+        let config = Config { yield_bps, slash_bps };
+        env.storage().persistent().set(&CONFIG_KEY, &config);
+        env.storage()
+            .persistent()
+            .extend_ttl(&CONFIG_KEY, TTL_THRESHOLD, TTL_TARGET);
+    }
+
+    /// Returns the current configuration.
+    pub fn get_config(env: Env) -> Config {
+        get_config(&env)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::testutils::{Address as _, Ledger};
+    use soroban_sdk::{symbol_short, Env};
+
+    #[test]
+    fn test_initialize_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(100);
+
+        let deployer = Address::random(&env);
+        let admin = Address::random(&env);
+        let token = Address::random(&env);
+
+        LendingContract::initialize(env.clone(), deployer, admin.clone(), token.clone());
+
+        let events = env.events().all();
+        assert_eq!(events.len(), 1);
+        let (topics, _data) = &events[0];
+        assert_eq!(topics.len(), 1);
+        assert_eq!(topics[0], symbol_short!("INIT"));
+    }
+
+    #[test]
+    #[should_panic(expected = "InvalidAdminAddress")]
+    fn test_initialize_rejects_zero_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(100);
+
+        let deployer = Address::random(&env);
+        let zero_admin = Address::from_contract_id(&env, &[0u8; 32]);
+        let token = Address::random(&env);
+
+        LendingContract::initialize(env, deployer, zero_admin, token);
+    }
+
+    #[test]
+    #[should_panic(expected = "InvalidTokenAddress")]
+    fn test_initialize_rejects_zero_token() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(100);
+
+        let deployer = Address::random(&env);
+        let admin = Address::random(&env);
+        let zero_token = Address::from_contract_id(&env, &[0u8; 32]);
+
+        LendingContract::initialize(env, deployer, admin, zero_token);
+    }
+
+    #[test]
+    fn test_update_config() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(100);
+
+        let deployer = Address::random(&env);
+        let admin = Address::random(&env);
+        let token = Address::random(&env);
+
+        LendingContract::initialize(env.clone(), deployer, admin.clone(), token);
+
+        LendingContract::update_config(env.clone(), admin, 300, 6000);
+
+        let config = LendingContract::get_config(env);
+        assert_eq!(config.yield_bps, 300);
+        assert_eq!(config.slash_bps, 6000);
+    }
+
+    #[test]
+    #[should_panic(expected = "StakeSummationOverflow")]
+    fn test_repay_overflow_protection() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(100);
+
+        let deployer = Address::random(&env);
+        let admin = Address::random(&env);
+        let token = Address::random(&env);
+        let borrower = Address::random(&env);
+
+        LendingContract::initialize(env.clone(), deployer, admin, token.clone());
+        LendingContract::request_loan(env.clone(), borrower.clone(), 1000);
+
+        // Create vouches with stakes that would overflow when summed
+        let voucher1 = Address::random(&env);
+        let voucher2 = Address::random(&env);
+
+        // Simulate large stakes that would overflow
+        let key = (symbol_short!("VOUCHES"), borrower.clone());
+        let mut vouches = Vec::new(&env);
+        vouches.push_back(Vouch {
+            voucher: voucher1,
+            stake: i128::MAX as u64,
+        });
+        vouches.push_back(Vouch {
+            voucher: voucher2,
+            stake: i128::MAX as u64,
+        });
+        env.storage().persistent().set(&key, &vouches);
+
+        // This should panic with StakeSummationOverflow
+        LendingContract::repay(env, borrower);
     }
 }
