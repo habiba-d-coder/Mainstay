@@ -60,6 +60,10 @@ const TTL_TARGET: u32 = 518_400;
 const YIELD_NUMERATOR: u64 = 200;
 const YIELD_DENOMINATOR: u64 = 10_000;
 
+/// Slash basis points: 50% = 5000 / 10_000 (#646).
+/// Guard: must not exceed 10_000 to prevent underflow in slash calculation.
+const SLASH_BPS: u64 = 5_000;
+
 /// Minimum vouch stake in stroops (#624).
 ///
 /// The yield formula `stake * 200 / 10_000` performs integer division and
@@ -284,6 +288,9 @@ impl LendingContract {
     pub fn slash(env: Env, admin: Address, borrower: Address) {
         require_admin(&env, &admin);
 
+        // #646: Guard against misconfigured SLASH_BPS exceeding 10_000.
+        assert!(SLASH_BPS <= 10_000);
+
         let key = loan_key(&borrower);
         let mut loan: Loan = env
             .storage()
@@ -314,7 +321,7 @@ impl LendingContract {
         // leaving them permanently locked in the contract.
         let mut slash_accum: u64 = 0;
         for v in vouches.iter() {
-            let slashed = v.stake / 2;
+            let slashed = v.stake * SLASH_BPS / 10_000;
             let returned = v.stake - slashed;
             slash_accum += slashed;
             if returned > 0 {
