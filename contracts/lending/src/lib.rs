@@ -392,6 +392,56 @@ impl LendingContract {
         }
     }
 
+    /// Withdraw a vouch before a loan is requested (#631).
+    ///
+    /// Allows a voucher to reclaim their stake if no active loan exists.
+    /// Panics if an active loan is found.
+    pub fn withdraw_vouch(env: Env, borrower: Address, voucher: Address) {
+        voucher.require_auth();
+
+        // #631: Check no active loan exists
+        let loan_key = loan_key(&borrower);
+        if let Some(existing) = env.storage().persistent().get::<_, Loan>(&loan_key) {
+            if existing.status == LoanStatus::Active {
+                panic_with_error!(&env, ContractError::VouchWithdrawNotAllowed);
+            }
+        }
+
+        let key = vouches_key(&borrower);
+        let mut vouches: Vec<Vouch> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut found_index = None;
+        for (i, v) in vouches.iter().enumerate() {
+            if v.voucher == voucher {
+                found_index = Some(i);
+                break;
+            }
+        }
+
+        if let Some(idx) = found_index {
+            let vouch = vouches.get(idx).unwrap();
+            let stake = vouch.stake;
+
+            vouches.remove(idx);
+            env.storage().persistent().set(&key, &vouches);
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+
+            let token_addr = get_token(&env);
+            let tok = token::Client::new(&env, &token_addr);
+            tok.transfer(
+                &env.current_contract_address(),
+                &voucher,
+                &(stake as i128),
+            );
+        }
+    }
+
     /// Returns the loan for a borrower, if any.
     pub fn get_loan(env: Env, borrower: Address) -> Option<Loan> {
         env.storage().persistent().get(&loan_key(&borrower))
