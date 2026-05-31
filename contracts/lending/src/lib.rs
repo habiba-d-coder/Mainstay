@@ -242,6 +242,14 @@ impl LendingContract {
             panic_with_error!(&env, ContractError::DuplicateVouch);
         }
 
+        // #630: Check if borrower already has an active loan
+        let loan_key = loan_key(&borrower);
+        if let Some(existing) = env.storage().persistent().get::<_, Loan>(&loan_key) {
+            if existing.status == LoanStatus::Active {
+                panic_with_error!(&env, ContractError::LoanAlreadyActive);
+            }
+        }
+
         if stake == 0 {
             panic_with_error!(&env, ContractError::ZeroStake);
         }
