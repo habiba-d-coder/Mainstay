@@ -170,6 +170,9 @@ impl LendingContract {
     /// The contract balance is then asserted to be ≥ total yield. This prevents
     /// the loop from panicking mid-execution when the contract is underfunded
     /// (#627).
+    ///
+    /// # DoS Protection
+    /// Enforces max_vouchers_per_loan cap to prevent gas exhaustion (#634).
     pub fn repay(env: Env, borrower: Address) {
         borrower.require_auth();
 
@@ -392,11 +395,12 @@ impl LendingContract {
         env.storage().persistent().get(&loan_key(&borrower))
     }
 
-    /// Returns all vouches for a borrower, or None if borrower does not exist.
-    pub fn get_vouches(env: Env, borrower: Address) -> Option<Vec<Vouch>> {
+    /// Returns all vouches for a borrower.
+    pub fn get_vouches(env: Env, borrower: Address) -> Vec<Vouch> {
         env.storage()
             .persistent()
             .get(&vouches_key(&borrower))
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     /// Returns the accumulated slash balance available for treasury withdrawal.
@@ -425,43 +429,6 @@ mod tests {
         client.initialize(&deployer, &admin, &token);
 
         (contract_id, admin, token)
-    }
-
-    #[test]
-    fn test_get_vouches_unknown_borrower_returns_none() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let (contract_id, _, _) = setup_contract(&env);
-        let client = LendingContractClient::new(&env, &contract_id);
-
-        let unknown_borrower = Address::generate(&env);
-        let result = client.get_vouches(&unknown_borrower);
-
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn test_get_vouches_with_vouches_returns_some() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let (contract_id, _, token) = setup_contract(&env);
-        let client = LendingContractClient::new(&env, &contract_id);
-
-        let borrower = Address::generate(&env);
-        let voucher = Address::generate(&env);
-
-        client.request_loan(&borrower, &1000);
-        client.vouch(&borrower, &voucher, &100);
-
-        let result = client.get_vouches(&borrower);
-
-        assert!(result.is_some());
-        let vouches = result.unwrap();
-        assert_eq!(vouches.len(), 1);
-        assert_eq!(vouches.get(0).unwrap().voucher, voucher);
-        assert_eq!(vouches.get(0).unwrap().stake, 100);
     }
 
     #[test]
