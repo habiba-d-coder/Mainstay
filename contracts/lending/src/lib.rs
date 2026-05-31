@@ -53,11 +53,19 @@ pub struct Vouch {
     pub stake: u64,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Borrower {
+    pub address: Address,
+    pub repayment_count: u32,
+    pub default_count: u32,
+}
+
 const TTL_THRESHOLD: u32 = 518_400;
 const TTL_TARGET: u32 = 518_400;
 
-/// Yield rate numerator: 2% = 200 / 10_000.
-const YIELD_NUMERATOR: u64 = 200;
+/// Default yield rate numerator: 2% = 200 / 10_000.
+const DEFAULT_YIELD_NUMERATOR: u64 = 200;
 const YIELD_DENOMINATOR: u64 = 10_000;
 
 /// Minimum vouch stake in stroops (#624).
@@ -75,6 +83,7 @@ const MIN_VOUCH_STAKE: u64 = 50;
 const ADMIN_KEY: soroban_sdk::Symbol = symbol_short!("ADMIN");
 const TOKEN_KEY: soroban_sdk::Symbol = symbol_short!("TOKEN");
 const SLASH_BAL: soroban_sdk::Symbol = symbol_short!("SL_BAL");
+const YIELD_BPS_KEY: soroban_sdk::Symbol = symbol_short!("YIELD_BPS");
 
 fn loan_key(borrower: &Address) -> (soroban_sdk::Symbol, Address) {
     (symbol_short!("LOAN"), borrower.clone())
@@ -82,6 +91,10 @@ fn loan_key(borrower: &Address) -> (soroban_sdk::Symbol, Address) {
 
 fn vouches_key(borrower: &Address) -> (soroban_sdk::Symbol, Address) {
     (symbol_short!("VOUCHES"), borrower.clone())
+}
+
+fn borrower_key(borrower: &Address) -> (soroban_sdk::Symbol, Address) {
+    (symbol_short!("BORROWER"), borrower.clone())
 }
 
 fn get_admin(env: &Env) -> Address {
@@ -110,14 +123,14 @@ pub struct LendingContract;
 
 #[contractimpl]
 impl LendingContract {
-    /// Initialize the lending contract with an admin and a payment token.
+    /// Initialize the lending contract with an admin, payment token, and yield rate.
     ///
     /// # Security
     /// `deployer` must sign this transaction. Without this guard any observer
     /// of the deployment transaction can race to call `initialize` first,
     /// setting themselves as admin (#625). Call this in the same transaction as
     /// contract deployment to eliminate the front-run window entirely.
-    pub fn initialize(env: Env, deployer: Address, admin: Address, token: Address) {
+    pub fn initialize(env: Env, deployer: Address, admin: Address, token: Address, yield_bps: u64) {
         // #625: Require the deployer's signature to prevent front-running.
         deployer.require_auth();
 
@@ -133,6 +146,10 @@ impl LendingContract {
         env.storage()
             .persistent()
             .extend_ttl(&TOKEN_KEY, TTL_THRESHOLD, TTL_TARGET);
+        env.storage().persistent().set(&YIELD_BPS_KEY, &yield_bps);
+        env.storage()
+            .persistent()
+            .extend_ttl(&YIELD_BPS_KEY, TTL_THRESHOLD, TTL_TARGET);
     }
 
     /// Request a new loan for the borrower.
@@ -159,12 +176,29 @@ impl LendingContract {
         env.storage()
             .persistent()
             .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+
+        let borrower_key_val = borrower_key(&borrower);
+        let borrower_record = env
+            .storage()
+            .persistent()
+            .get::<_, Borrower>(&borrower_key_val)
+            .unwrap_or_else(|| Borrower {
+                address: borrower.clone(),
+                repayment_count: 0,
+                default_count: 0,
+            });
+        env.storage()
+            .persistent()
+            .set(&borrower_key_val, &borrower_record);
+        env.storage()
+            .persistent()
+            .extend_ttl(&borrower_key_val, TTL_THRESHOLD, TTL_TARGET);
     }
 
-    /// Repay the active loan and distribute 2% yield to all vouchers.
+    /// Repay the active loan and distribute yield to all vouchers.
     ///
     /// # Security
-    /// Total yield (`Σ stake * 200 / 10_000`) is computed before any transfer.
+    /// Total yield is computed before any transfer.
     /// The contract balance is then asserted to be ≥ total yield. This prevents
     /// the loop from panicking mid-execution when the contract is underfunded
     /// (#627).
@@ -188,10 +222,16 @@ impl LendingContract {
             .get(&vouches_key(&borrower))
             .unwrap_or_else(|| Vec::new(&env));
 
+        let yield_bps: u64 = env
+            .storage()
+            .persistent()
+            .get(&YIELD_BPS_KEY)
+            .unwrap_or(DEFAULT_YIELD_NUMERATOR);
+
         // #627: Pre-calculate total yield before touching any balances.
         let mut total_yield: u64 = 0;
         for v in vouches.iter() {
-            total_yield += v.stake * YIELD_NUMERATOR / YIELD_DENOMINATOR;
+            total_yield += v.stake * yield_bps / YIELD_DENOMINATOR;
         }
 
         // #627: Assert the contract holds enough tokens to cover every payout.
@@ -208,8 +248,23 @@ impl LendingContract {
             .persistent()
             .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
 
+        let borrower_key_val = borrower_key(&borrower);
+        if let Some(mut borrower_record) = env
+            .storage()
+            .persistent()
+            .get::<_, Borrower>(&borrower_key_val)
+        {
+            borrower_record.repayment_count += 1;
+            env.storage()
+                .persistent()
+                .set(&borrower_key_val, &borrower_record);
+            env.storage()
+                .persistent()
+                .extend_ttl(&borrower_key_val, TTL_THRESHOLD, TTL_TARGET);
+        }
+
         for v in vouches.iter() {
-            let yield_amount = v.stake * YIELD_NUMERATOR / YIELD_DENOMINATOR;
+            let yield_amount = v.stake * yield_bps / YIELD_DENOMINATOR;
             if yield_amount > 0 {
                 tok.transfer(
                     &env.current_contract_address(),
@@ -295,6 +350,21 @@ impl LendingContract {
         env.storage()
             .persistent()
             .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+
+        let borrower_key_val = borrower_key(&borrower);
+        if let Some(mut borrower_record) = env
+            .storage()
+            .persistent()
+            .get::<_, Borrower>(&borrower_key_val)
+        {
+            borrower_record.default_count += 1;
+            env.storage()
+                .persistent()
+                .set(&borrower_key_val, &borrower_record);
+            env.storage()
+                .persistent()
+                .extend_ttl(&borrower_key_val, TTL_THRESHOLD, TTL_TARGET);
+        }
 
         let vouches: Vec<Vouch> = env
             .storage()
@@ -382,4 +452,70 @@ impl LendingContract {
             .get(&SLASH_BAL)
             .unwrap_or(0u64)
     }
-}
+
+    /// Allow a voucher to withdraw their stake if no active loan exists.
+    pub fn withdraw_vouch(env: Env, voucher: Address, borrower: Address) {
+        voucher.require_auth();
+
+        let loan_key_val = loan_key(&borrower);
+        if let Some(loan) = env.storage().persistent().get::<_, Loan>(&loan_key_val) {
+            if loan.status == LoanStatus::Active {
+                panic_with_error!(&env, ContractError::LoanAlreadyActive);
+            }
+        }
+
+        let vouches_key_val = vouches_key(&borrower);
+        let mut vouches: Vec<Vouch> = env
+            .storage()
+            .persistent()
+            .get(&vouches_key_val)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut vouch_stake: u64 = 0;
+        let mut found = false;
+        let mut new_vouches = Vec::new(&env);
+
+        for v in vouches.iter() {
+            if v.voucher == voucher {
+                vouch_stake = v.stake;
+                found = true;
+            } else {
+                new_vouches.push_back(v);
+            }
+        }
+
+        if !found || vouch_stake == 0 {
+            panic_with_error!(&env, ContractError::ZeroStake);
+        }
+
+        env.storage().persistent().set(&vouches_key_val, &new_vouches);
+        env.storage()
+            .persistent()
+            .extend_ttl(&vouches_key_val, TTL_THRESHOLD, TTL_TARGET);
+
+        let token_addr = get_token(&env);
+        let tok = token::Client::new(&env, &token_addr);
+        tok.transfer(
+            &env.current_contract_address(),
+            &voucher,
+            &(vouch_stake as i128),
+        );
+    }
+
+    /// Get the credit score for a borrower based on repayment history.
+    pub fn get_credit_score(env: Env, borrower: Address) -> u32 {
+        let borrower_key_val = borrower_key(&borrower);
+        if let Some(borrower_record) = env
+            .storage()
+            .persistent()
+            .get::<_, Borrower>(&borrower_key_val)
+        {
+            let total = borrower_record.repayment_count + borrower_record.default_count;
+            if total == 0 {
+                return 0;
+            }
+            ((borrower_record.repayment_count as u64 * 100) / (total as u64)) as u32
+        } else {
+            0
+        }
+    }
