@@ -152,6 +152,14 @@ impl LendingContract {
             }
         }
 
+        // #628: Check contract has sufficient balance before disbursing
+        let token_addr = get_token(&env);
+        let tok = token::Client::new(&env, &token_addr);
+        let contract_balance = tok.balance(&env.current_contract_address());
+        if contract_balance < (amount as i128) {
+            panic_with_error!(&env, ContractError::InsufficientFunds);
+        }
+
         let loan = Loan {
             borrower: borrower.clone(),
             amount,
@@ -161,6 +169,13 @@ impl LendingContract {
         env.storage()
             .persistent()
             .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+
+        // Transfer the loan amount to the borrower
+        tok.transfer(
+            &env.current_contract_address(),
+            &borrower,
+            &(amount as i128),
+        );
     }
 
     /// Repay the active loan and distribute 2% yield to all vouchers.
