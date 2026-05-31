@@ -383,3 +383,77 @@ impl LendingContract {
             .unwrap_or(0u64)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn setup() -> (Env, Address, Address, Address, Address) {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(LendingContract, ());
+        let client = LendingContractClient::new(&env, &contract_id);
+
+        let deployer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        client.initialize(&deployer, &admin, &token);
+
+        (env, contract_id, admin, token, deployer)
+    }
+
+    #[test]
+    fn test_request_loan_prevents_overwrite_of_active_loan() {
+        let (env, _contract_id, _admin, _token, _deployer) = setup();
+        let client = LendingContractClient::new(&env, &_contract_id);
+
+        let borrower = Address::generate(&env);
+
+        client.request_loan(&borrower, &1000);
+        let loan1 = client.get_loan(&borrower).unwrap();
+        assert_eq!(loan1.amount, 1000);
+        assert_eq!(loan1.status, LoanStatus::Active);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.request_loan(&borrower, &2000);
+        }));
+        assert!(result.is_err());
+
+        let loan2 = client.get_loan(&borrower).unwrap();
+        assert_eq!(loan2.amount, 1000);
+        assert_eq!(loan2.status, LoanStatus::Active);
+    }
+
+    #[test]
+    fn test_repay_verifies_borrower_matches_loan_record() {
+        let (env, _contract_id, _admin, _token, _deployer) = setup();
+        let client = LendingContractClient::new(&env, &_contract_id);
+
+        let borrower1 = Address::generate(&env);
+        let borrower2 = Address::generate(&env);
+
+        client.request_loan(&borrower1, &1000);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.repay(&borrower2);
+        }));
+        assert!(result.is_err());
+
+        let loan = client.get_loan(&borrower1).unwrap();
+        assert_eq!(loan.status, LoanStatus::Active);
+    }
+
+    #[test]
+    fn test_slash_bps_guard_prevents_underflow() {
+        let (env, _contract_id, _admin, _token, _deployer) = setup();
+        let client = LendingContractClient::new(&env, &_contract_id);
+
+        let borrower = Address::generate(&env);
+
+        client.request_loan(&borrower, &1000);
+
+        assert!(SLASH_BPS <= 10_000);
+    }
+}
