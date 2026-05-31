@@ -36,6 +36,7 @@ pub enum LoanStatus {
     Active = 0,
     Repaid = 1,
     Defaulted = 2,
+    None = 3,
 }
 
 #[contracttype]
@@ -381,5 +382,16 @@ impl LendingContract {
             .persistent()
             .get(&SLASH_BAL)
             .unwrap_or(0u64)
+    }
+
+    /// Returns the loan status for a borrower.
+    ///
+    /// Returns `LoanStatus::None` if no loan exists for the borrower.
+    pub fn loan_status(env: Env, borrower: Address) -> LoanStatus {
+        env.storage()
+            .persistent()
+            .get::<_, Loan>(&loan_key(&borrower))
+            .map(|loan| loan.status)
+            .unwrap_or(LoanStatus::None)
     }
 }
