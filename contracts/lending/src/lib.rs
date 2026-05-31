@@ -165,11 +165,16 @@ impl LendingContract {
 
     /// Repay the active loan and distribute 2% yield to all vouchers.
     ///
+    /// # Repayment Amount
+    /// Borrower must repay: loan.amount + total_yield
+    /// The yield is calculated as: Σ (stake * 200 / 10_000) for all vouchers.
+    /// This ensures yield comes from the borrower's repayment, not pre-minted
+    /// contract balance (#632).
+    ///
     /// # Security
     /// Total yield (`Σ stake * 200 / 10_000`) is computed before any transfer.
-    /// The contract balance is then asserted to be ≥ total yield. This prevents
-    /// the loop from panicking mid-execution when the contract is underfunded
-    /// (#627).
+    /// The borrower's repayment is collected first, then distributed to vouchers.
+    /// This prevents accounting mismatches (#632).
     ///
     /// # DoS Protection
     /// Enforces max_vouchers_per_loan cap to prevent gas exhaustion (#634).
@@ -198,19 +203,21 @@ impl LendingContract {
             panic_with_error!(&env, ContractError::TooManyVouchers);
         }
 
-        // #627: Pre-calculate total yield before touching any balances.
+        // #632: Pre-calculate total yield before collecting repayment.
         let mut total_yield: u64 = 0;
         for v in vouches.iter() {
             total_yield += v.stake * YIELD_NUMERATOR / YIELD_DENOMINATOR;
         }
 
-        // #627: Assert the contract holds enough tokens to cover every payout.
+        // #632: Collect loan amount + yield from borrower.
         let token_addr = get_token(&env);
         let tok = token::Client::new(&env, &token_addr);
-        let contract_balance = tok.balance(&env.current_contract_address());
-        if contract_balance < (total_yield as i128) {
-            panic_with_error!(&env, ContractError::InsufficientFunds);
-        }
+        let total_repayment = loan.amount + total_yield;
+        tok.transfer(
+            &borrower,
+            &env.current_contract_address(),
+            &(total_repayment as i128),
+        );
 
         loan.status = LoanStatus::Repaid;
         env.storage().persistent().set(&key, &loan);
@@ -218,6 +225,7 @@ impl LendingContract {
             .persistent()
             .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
 
+        // #632: Distribute yield to vouchers from collected repayment.
         for v in vouches.iter() {
             let yield_amount = v.stake * YIELD_NUMERATOR / YIELD_DENOMINATOR;
             if yield_amount > 0 {
@@ -500,6 +508,37 @@ mod tests {
         }
 
         // Repay should succeed with exactly 100 vouchers
+        client.repay(&borrower);
+
+        let loan = client.get_loan(&borrower);
+        assert!(loan.is_some());
+        assert_eq!(loan.unwrap().status, LoanStatus::Repaid);
+    }
+
+    #[test]
+    fn test_repay_collects_loan_amount_plus_yield() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (contract_id, _, _) = setup_contract(&env);
+        let client = LendingContractClient::new(&env, &contract_id);
+
+        let borrower = Address::generate(&env);
+        let loan_amount = 1000u64;
+        client.request_loan(&borrower, &loan_amount);
+
+        let voucher1 = Address::generate(&env);
+        let voucher2 = Address::generate(&env);
+        let stake1 = 500u64;
+        let stake2 = 500u64;
+
+        client.vouch(&borrower, &voucher1, &stake1);
+        client.vouch(&borrower, &voucher2, &stake2);
+
+        // Expected yield: (500 * 200 / 10_000) + (500 * 200 / 10_000) = 10 + 10 = 20
+        // Total repayment should be: 1000 + 20 = 1020
+        // Borrower must provide this amount in the repay call
+
         client.repay(&borrower);
 
         let loan = client.get_loan(&borrower);
