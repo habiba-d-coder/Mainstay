@@ -2,7 +2,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, token,
-    Address, Env, Vec,
+    Address, Env, Symbol, Vec,
 };
 
 #[contracterror]
@@ -75,6 +75,8 @@ const MIN_VOUCH_STAKE: u64 = 50;
 const ADMIN_KEY: soroban_sdk::Symbol = symbol_short!("ADMIN");
 const TOKEN_KEY: soroban_sdk::Symbol = symbol_short!("TOKEN");
 const SLASH_BAL: soroban_sdk::Symbol = symbol_short!("SL_BAL");
+
+const LOAN_REQUESTED: Symbol = symbol_short!("loan_req");
 
 fn loan_key(borrower: &Address) -> (soroban_sdk::Symbol, Address) {
     (symbol_short!("LOAN"), borrower.clone())
@@ -159,6 +161,9 @@ impl LendingContract {
         env.storage()
             .persistent()
             .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+
+        env.events()
+            .publish((LOAN_REQUESTED,), (borrower.clone(), amount));
     }
 
     /// Repay the active loan and distribute 2% yield to all vouchers.
@@ -381,5 +386,50 @@ impl LendingContract {
             .persistent()
             .get(&SLASH_BAL)
             .unwrap_or(0u64)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_request_loan_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let deployer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let token_addr = Address::generate(&env);
+        let borrower = Address::generate(&env);
+
+        let contract_id = env.register(LendingContract, ());
+        let client = LendingContractClient::new(&env, &contract_id);
+
+        client.initialize(&deployer, &admin, &token_addr);
+
+        let amount = 1000u64;
+        client.request_loan(&borrower, &amount);
+
+        let events = env.events().all();
+        let loan_req_events: Vec<_> = events
+            .iter()
+            .filter(|e| {
+                if let soroban_sdk::xdr::ContractEvent::V0(v0) = &e.event {
+                    v0.topics.len() > 0
+                        && v0.topics.get(0).map_or(false, |t| {
+                            if let soroban_sdk::xdr::ScVal::Symbol(sym) = t {
+                                sym.0.as_slice() == b"loan_req"
+                            } else {
+                                false
+                            }
+                        })
+                } else {
+                    false
+                }
+            })
+            .collect();
+
+        assert!(!loan_req_events.is_empty(), "request_loan should emit event");
     }
 }
