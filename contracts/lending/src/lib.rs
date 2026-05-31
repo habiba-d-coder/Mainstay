@@ -425,4 +425,12 @@ impl LendingContract {
         }
         total as i128
     }
+
+    /// Check if a borrower is eligible for a loan based on total vouched amount.
+    ///
+    /// Returns true if the total vouched amount is >= threshold.
+    pub fn is_eligible(env: Env, borrower: Address, threshold: i128) -> bool {
+        let total = Self::total_vouched(env, borrower);
+        total >= threshold
+    }
 }
