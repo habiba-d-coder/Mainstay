@@ -77,6 +77,7 @@ const TOKEN_KEY: soroban_sdk::Symbol = symbol_short!("TOKEN");
 const SLASH_BAL: soroban_sdk::Symbol = symbol_short!("SL_BAL");
 
 const LOAN_REQUESTED: Symbol = symbol_short!("loan_req");
+const LOAN_REPAID: Symbol = symbol_short!("loan_rep");
 const VOUCH_CREATED: Symbol = symbol_short!("vouch_cr");
 
 fn loan_key(borrower: &Address) -> (soroban_sdk::Symbol, Address) {
@@ -224,6 +225,9 @@ impl LendingContract {
                 );
             }
         }
+
+        env.events()
+            .publish((LOAN_REPAID,), (borrower.clone(), total_yield));
     }
 
     /// Vouch for a borrower with a token stake.
@@ -477,5 +481,45 @@ mod tests {
             .collect();
 
         assert!(!vouch_events.is_empty(), "vouch should emit event");
+    }
+
+    #[test]
+    fn test_repay_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let deployer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let token_addr = Address::generate(&env);
+        let borrower = Address::generate(&env);
+
+        let contract_id = env.register(LendingContract, ());
+        let client = LendingContractClient::new(&env, &contract_id);
+
+        client.initialize(&deployer, &admin, &token_addr);
+        client.request_loan(&borrower, &1000u64);
+
+        client.repay(&borrower);
+
+        let events = env.events().all();
+        let repay_events: Vec<_> = events
+            .iter()
+            .filter(|e| {
+                if let soroban_sdk::xdr::ContractEvent::V0(v0) = &e.event {
+                    v0.topics.len() > 0
+                        && v0.topics.get(0).map_or(false, |t| {
+                            if let soroban_sdk::xdr::ScVal::Symbol(sym) = t {
+                                sym.0.as_slice() == b"loan_rep"
+                            } else {
+                                false
+                            }
+                        })
+                } else {
+                    false
+                }
+            })
+            .collect();
+
+        assert!(!repay_events.is_empty(), "repay should emit event");
     }
 }
