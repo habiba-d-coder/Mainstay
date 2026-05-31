@@ -387,6 +387,14 @@ impl LendingContract {
     pub fn is_initialized(env: Env) -> bool {
         env.storage().persistent().has(&ADMIN_KEY)
     }
+
+    /// Returns the current admin address.
+    pub fn get_admin(env: Env) -> Address {
+        env.storage()
+            .persistent()
+            .get(&ADMIN_KEY)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized))
+    }
 }
 
 #[cfg(test)]
@@ -410,5 +418,23 @@ mod tests {
 
         client.initialize(&deployer, &admin, &token);
         assert!(client.is_initialized());
+    }
+
+    #[test]
+    fn test_get_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(LendingContract, ());
+        let client = LendingContractClient::new(&env, &contract_id);
+
+        let deployer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        client.initialize(&deployer, &admin, &token);
+
+        let retrieved_admin = client.get_admin();
+        assert_eq!(retrieved_admin, admin);
     }
 }
